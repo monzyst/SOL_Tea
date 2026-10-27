@@ -1,0 +1,119 @@
+# SOL_Tea local/production-shaped topology.
+#
+# Three roles, deliberately separate processes:
+#
+#   worker      owns market data and the decision path; needs EGRESS to RPC/WSS
+#   reconciler  independently settles intents against the chain; needs EGRESS
+#   signer      holds signing authority; by default NO egress is required for
+#               observe deployments and it is only reachable from the worker
+#               network, never from the host
+#
+# Why separate and not one process with flags: the reconciler must be able to
+# disagree with the worker (that is its purpose), and the signing key should not
+# live in the process that ingests untrusted websocket data.
+#
+# Secrets come from the environment or from an env_file that is git-ignored.
+# Nothing here contains a key, a token or an RPC URL with an API key in it.
+
+name: sol-tea
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: sol-tea:local
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  volumes:
+    # Shared durable state. A single volume keeps the SQLite store and the
+    # append-only journal on the same filesystem, which is what makes the
+    # one-transaction intent+outbox write meaningful.
+    - sol-tea-state:/app/var
+  logging:
+    driver: json-file
+    options:
+      max-size: '20m'
+      max-file: '5'
+
+services:
+  worker:
+    <<: *common
+    command: ['node', 'dist/apps/solana-worker/src/main.js']
+    environment:
+      SERVICE_NAME: sol-tea-worker
+      HEALTH_PORT: '8787'
+      STORE_PATH: /app/var/state/sol-tea.db
+      JOURNAL_DIR: /app/var/journal
+      # Shipping default: observe only. Turning this on is a deliberate act.
+      ENABLE_LIVE_EXECUTION: 'false'
+    ports:
+      - '127.0.0.1:8787:8787'
+    healthcheck:
+      # /healthz reports stream status, feed health and whether the engine can
+      # price at all, so this fails when the process is up but the feed is dead.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:8787/healthz').then(r=>r.json()).then(d=>process.exit(d.status==='ok'&&d.feedHealthy?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    stop_grace_period: 30s
+
+  reconciler:
+    <<: *common
+    command: ['node', 'dist/apps/reconciler/src/main.js']
+    environment:
+      SERVICE_NAME: sol-tea-reconciler
+      HEALTH_PORT: '8788'
+      STORE_PATH: /app/var/state/sol-tea.db
+      JOURNAL_DIR: /app/var/journal
+    ports:
+      - '127.0.0.1:8788:8788'
+    healthcheck:
+      test: ['CMD-SHELL', 'node -e "fetch(''http://127.0.0.1:8788/healthz'').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 20s
+
+  signer:
+    <<: *common
+    command: ['node', 'dist/apps/signer-service/src/main.js']
+    environment:
+      SERVICE_NAME: sol-tea-signer
+      HEALTH_PORT: '8789'
+      # The signer refuses to start unless a real token is supplied.
+      SIGNER_SERVICE_TOKEN: ${SIGNER_SERVICE_TOKEN:-}
+      SIGNER_STORE_KEY: ${SIGNER_STORE_KEY:-}
+    # No published port: reachable only from the compose network. Publish
+    # 127.0.0.1:8789 yourself only for local debugging.
+    expose:
+      - '8789'
+    networks:
+      - default
+      - signer-link
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:8789/healthz',{headers:{authorization:'Bearer '+process.env.SIGNER_SERVICE_TOKEN}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 15s
+
+volumes:
+  sol-tea-state:
+
+networks:
+  default:
+  # Isolated network so the signer can be firewalled away from the internet in
+  # a real deployment (attach the worker to it only if it must call /sign).
+  signer-link:
+    internal: true

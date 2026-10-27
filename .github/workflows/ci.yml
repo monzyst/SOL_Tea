@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref: a stale green build is worse than none.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: typecheck / test / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # `npm ci` is only meaningful if the lockfile is committed and in sync;
+      # that is exactly the guarantee this pipeline exists to enforce.
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Module boundaries
+        run: npm run lint:boundaries
+
+      - name: Configuration validates
+        env:
+          # Public mainnet endpoints: present so config validation has something
+          # to validate. No key, no secret, and none is needed by these checks.
+          RPC_HTTP_URL: https://api.mainnet-beta.solana.com
+          RPC_WS_URL: wss://api.mainnet-beta.solana.com
+        run: npm run check:config
+
+      - name: Build
+        run: npm run build
+
+      # A green typecheck does not prove the roles produce runnable entrypoints,
+      # so each build output is parsed by the runtime.
+      - name: Entrypoints compile to runnable files
+        run: |
+          for f in \
+            dist/apps/solana-worker/src/main.js \
+            dist/apps/reconciler/src/main.js \
+            dist/apps/signer-service/src/main.js
+          do
+            test -f "$f" || { echo "missing build output: $f"; exit 1; }
+            node --check "$f"
+          done
+
+  secrets:
+    name: no credentials committed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # A trading repository must never carry a key. This is a coarse but real
+      # guard: it fails on a committed .env, on key material, and on the shape of
+      # a leaked Solana keypair.
+      - name: Reject committed secrets
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if git ls-files | grep -E '(^|/)\.env$' ; then
+            echo "::error::a .env file is committed; secrets belong in the environment"
+            fail=1
+          fi
+
+          if git ls-files | grep -E '\.(pem|key|p12|pfx)$' ; then
+            echo "::error::key material is committed"
+            fail=1
+          fi
+
+          # Solana CLI keypair files are JSON arrays of ~64 bytes.
+          if git ls-files -z | xargs -0 grep -lE '^\s*\[[[:space:]]*[0-9]{1,3}(,[[:space:]]*[0-9]{1,3}){63}' 2>/dev/null ; then
+            echo "::error::a Solana keypair JSON is committed"
+            fail=1
+          fi
+
+          exit "$fail"
