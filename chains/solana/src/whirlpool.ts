@@ -4,7 +4,7 @@
  * Two jobs, deliberately separated:
  *  - `decodeWhirlpool` turns live account bytes into a *coherent* pool snapshot
  *    (reserves + price + fees + slot). Pure function, no I/O, unit-testable.
- *  - `quoteExactInConstantProduct` applies the constant-product approximation over the current
+ *  - `quoteExactIn` applies the constant-product approximation over the current
  *    reserves with the pool's fee tier. It is intentionally conservative and
  *    clearly labelled: the authoritative CLMM quote comes from the official
  *    Orca SDK at execution time (see `quoter.ts`), which walks real tick arrays.

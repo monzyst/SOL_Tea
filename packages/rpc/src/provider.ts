@@ -1,146 +1,174 @@
 /**
  * packages/rpc — provider pool with measured health and honest failover.
  *
- * Failover is driven by observed failures, not by configuration optimism. A
- * provider is only marked degraded after consecutive failures, and every switch
- * is logged: a silent failover that nobody notices is how an engine ends up
- * running on a degraded provider for a week.
+ * Design notes (V6 §10/§12):
+ *  - A provider is only marked unhealthy after *consecutive* failures, so one
+ *    timeout does not flap the whole engine.
+ *  - Every call is measured with a monotonic clock and recorded as an
+ *    observation (provider, method, RTT, status) for the quality report.
+ *  - Failover is bounded: each provider is tried at most once per read. Writes
+ *    are never retried here — the executor owns idempotency by signature.
  */
 
 import { Connection } from '@solana/web3.js';
-import type { Logger } from '../../obs/src';
+import { LatencyHistogram, nowMonoNs, type Logger } from '../../obs/src';
+
+export type ProviderRole = 'primary' | 'secondary';
 
 export interface ProviderConfig {
   readonly id: string;
+  readonly role: ProviderRole;
   readonly httpUrl: string;
   readonly wsUrl: string;
-  readonly role: 'primary' | 'secondary';
 }
 
 export interface ProviderState {
-  readonly id: string;
-  readonly role: 'primary' | 'secondary';
-  readonly healthy: boolean;
-  readonly consecutiveFailures: number;
-  readonly lastErrorAtUtc: string | null;
-  readonly lastSuccessAtUtc: string | null;
+  readonly config: ProviderConfig;
+  readonly connection: Connection;
+  healthy: boolean;
+  consecutiveFailures: number;
+  lastSuccessUtc: string | null;
+  lastErrorUtc: string | null;
+  readonly latency: LatencyHistogram;
+}
+
+export interface ProviderPoolOptions {
+  readonly commitment: 'confirmed' | 'finalized';
+  readonly logger: Logger;
+  /** Consecutive failures before a provider leaves rotation. */
+  readonly failureThreshold?: number;
 }
 
 export class AllProvidersFailedError extends Error {
-  constructor(readonly attempts: number) {
-    super(`all ${attempts} RPC providers failed`);
+  constructor(
+    readonly method: string,
+    readonly causes: readonly string[],
+  ) {
+    super(`all RPC providers failed for ${method}: ${causes.join(' | ')}`);
     this.name = 'AllProvidersFailedError';
   }
 }
 
-interface TrackedProvider {
-  readonly config: ProviderConfig;
-  readonly connection: Connection;
-  consecutiveFailures: number;
-  healthy: boolean;
-  lastErrorAtUtc: string | null;
-  lastSuccessAtUtc: string | null;
-}
-
-/** Build provider configs, skipping an incomplete secondary pair. */
-export function buildProviderConfigs(input: {
-  httpUrl: string;
-  wsUrl: string;
-  httpUrlSecondary: string;
-  wsUrlSecondary: string;
-}): ProviderConfig[] {
-  const configs: ProviderConfig[] = [
-    { id: 'primary', httpUrl: input.httpUrl, wsUrl: input.wsUrl, role: 'primary' },
-  ];
-  if (input.httpUrlSecondary !== '' && input.wsUrlSecondary !== '') {
-    configs.push({
-      id: 'secondary',
-      httpUrl: input.httpUrlSecondary,
-      wsUrl: input.wsUrlSecondary,
-      role: 'secondary',
-    });
-  }
-  return configs;
-}
-
 export class ProviderPool {
-  private readonly providers: TrackedProvider[];
-  private readonly failureThreshold = 2;
+  private readonly states: ProviderState[];
+  private readonly failureThreshold: number;
 
   constructor(
     configs: readonly ProviderConfig[],
-    private readonly options: {
-      commitment: 'confirmed' | 'finalized';
-      logger: Logger;
-    },
+    private readonly options: ProviderPoolOptions,
   ) {
-    if (configs.length === 0) throw new Error('at least one RPC provider is required');
-    this.providers = configs.map((config) => ({
+    if (configs.length === 0) throw new Error('ProviderPool requires at least one provider');
+    if (new Set(configs.map((c) => c.id)).size !== configs.length) {
+      throw new Error('provider ids must be unique');
+    }
+    this.failureThreshold = options.failureThreshold ?? 2;
+    this.states = configs.map((config) => ({
       config,
-      // The Connection takes the HTTP endpoint as its base and uses wsUrl for
-      // subscriptions: passing a wss:// URL as the base throws in web3.js.
       connection: new Connection(config.httpUrl, {
         commitment: options.commitment,
-        wsEndpoint: config.wsUrl,
+        disableRetryOnRateLimit: false,
+        confirmTransactionInitialTimeout: 30_000,
       }),
-      consecutiveFailures: 0,
       healthy: true,
-      lastErrorAtUtc: null,
-      lastSuccessAtUtc: null,
+      consecutiveFailures: 0,
+      lastSuccessUtc: null,
+      lastErrorUtc: null,
+      latency: new LatencyHistogram(256),
     }));
   }
 
-  get primary(): TrackedProvider {
-    return this.providers.find((p) => p.config.role === 'primary') ?? (this.providers[0] as TrackedProvider);
+  get primary(): ProviderState {
+    return this.states[0] as ProviderState;
   }
 
-  get all(): readonly TrackedProvider[] {
-    return this.providers;
+  /** Healthy providers first, then degraded ones — never an empty list. */
+  rotation(): ProviderState[] {
+    return [...this.states.filter((s) => s.healthy), ...this.states.filter((s) => !s.healthy)];
+  }
+
+  statesSnapshot(): Array<Record<string, unknown>> {
+    return this.states.map((s) => ({
+      id: s.config.id,
+      role: s.config.role,
+      healthy: s.healthy,
+      consecutiveFailures: s.consecutiveFailures,
+      lastSuccessUtc: s.lastSuccessUtc,
+      lastErrorUtc: s.lastErrorUtc,
+      latencyMs: s.latency.snapshot(),
+    }));
   }
 
   /**
-   * Run an operation with automatic failover. The operation receives a
-   * Connection so the caller never holds a stale reference after a switch.
+   * Execute an idempotent READ against the first provider that answers.
+   * Reads are safe to re-issue; transaction submission never routes here.
    */
-  async withFailover<T>(operation: (connection: Connection, providerId: string) => Promise<T>): Promise<T> {
-    let lastError: Error | null = null;
-
-    for (const provider of this.providers) {
+  async read<T>(method: string, fn: (connection: Connection) => Promise<T>): Promise<T> {
+    const causes: string[] = [];
+    for (const state of this.rotation()) {
+      const started = nowMonoNs();
       try {
-        const result = await operation(provider.connection, provider.config.id);
-        if (provider.consecutiveFailures > 0 || !provider.healthy) {
-          this.options.logger.info('rpc_provider_recovered', { providerId: provider.config.id });
-        }
-        provider.consecutiveFailures = 0;
-        provider.healthy = true;
-        provider.lastSuccessAtUtc = new Date().toISOString();
+        const result = await fn(state.connection);
+        this.onSuccess(state, started, method);
         return result;
       } catch (error) {
-        lastError = error as Error;
-        provider.consecutiveFailures += 1;
-        provider.lastErrorAtUtc = new Date().toISOString();
-        if (provider.consecutiveFailures >= this.failureThreshold) {
-          provider.healthy = false;
-          this.options.logger.warn('rpc_provider_degraded', {
-            providerId: provider.config.id,
-            consecutiveFailures: provider.consecutiveFailures,
-            error: lastError.message,
-          });
-        }
+        this.onFailure(state, started, method, error);
+        causes.push(`${state.config.id}: ${(error as Error).message}`);
       }
     }
-
-    throw new AllProvidersFailedError(this.providers.length);
+    throw new AllProvidersFailedError(method, causes);
   }
 
-  statesSnapshot(): ProviderState[] {
-    return this.providers.map((provider) => ({
-      id: provider.config.id,
-      role: provider.config.role,
-      healthy: provider.healthy,
-      consecutiveFailures: provider.consecutiveFailures,
-      lastErrorAtUtc: provider.lastErrorAtUtc,
-      lastSuccessAtUtc: provider.lastSuccessAtUtc,
-    }));
+  private onSuccess(state: ProviderState, started: bigint, method: string): void {
+    const ms = Number(nowMonoNs() - started) / 1_000_000;
+    state.latency.observe(ms);
+    const recovered = !state.healthy;
+    state.consecutiveFailures = 0;
+    state.healthy = true;
+    state.lastSuccessUtc = new Date().toISOString();
+    if (recovered) {
+      this.options.logger.info('rpc_provider_recovered', { providerId: state.config.id, method });
+    }
+    this.options.logger.debug('rpc_call_ok', {
+      providerId: state.config.id,
+      method,
+      latencyMs: Number(ms.toFixed(2)),
+    });
   }
+
+  private onFailure(state: ProviderState, started: bigint, method: string, error: unknown): void {
+    const ms = Number(nowMonoNs() - started) / 1_000_000;
+    state.latency.observe(ms);
+    state.consecutiveFailures += 1;
+    state.lastErrorUtc = new Date().toISOString();
+    const wasHealthy = state.healthy;
+    if (state.consecutiveFailures >= this.failureThreshold) state.healthy = false;
+    this.options.logger.warn('rpc_call_failed', {
+      providerId: state.config.id,
+      method,
+      latencyMs: Number(ms.toFixed(2)),
+      consecutiveFailures: state.consecutiveFailures,
+      transitionedToDegraded: wasHealthy && !state.healthy,
+      error: (error as Error).message,
+    });
+  }
+}
+
+export function buildProviderConfigs(input: {
+  httpUrl: string;
+  wsUrl: string;
+  httpUrlSecondary?: string | undefined;
+  wsUrlSecondary?: string | undefined;
+}): ProviderConfig[] {
+  const out: ProviderConfig[] = [
+    { id: 'primary', role: 'primary', httpUrl: input.httpUrl, wsUrl: input.wsUrl },
+  ];
+  if (input.httpUrlSecondary && input.wsUrlSecondary) {
+    out.push({
+      id: 'secondary',
+      role: 'secondary',
+      httpUrl: input.httpUrlSecondary,
+      wsUrl: input.wsUrlSecondary,
+    });
+  }
+  return out;
 }

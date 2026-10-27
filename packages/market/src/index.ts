@@ -1,153 +1,148 @@
 /**
  * packages/market — coherent pool state and the feed the execution layer reads.
  *
- * The central idea: state is *coherent* or it is not usable. An update older than
- * `maxQuoteAgeMs`, a pool whose legs are further apart than `maxSkewSlots`, or a
- * pool flagged DEGRADED are all refused with a reason code. Refusing is cheap;
- * trading on a torn view is not.
+ * The core distinction this module enforces (V6 §10):
+ *   "no data"  !=  "no opportunity"
  *
- * Nothing here does I/O — it is a store, so it stays fast and testable.
+ * A pool whose last update is older than `maxQuoteAgeMs`, whose stream was
+ * flagged as gapped, or whose two legs updated more than `maxSkewSlots` apart is
+ * *incoherent*. Execution asks for a coherent pair and receives an explicit
+ * reason when it cannot have one, so a stale feed can never be mistaken for a
+ * thin market and quietly produce zero trades.
  */
 
-import type { ReasonCode } from '../../domain/src';
 import type { PoolSnapshot } from '../../../chains/solana/src/whirlpool';
-import { nowMonoNs } from '../../obs/src';
+import type { ReasonCode } from '../../domain/src';
 
-export interface MarketStateOptions {
-  /** A snapshot older than this may not be quoted against. */
-  readonly maxQuoteAgeMs: number;
-  /** Two legs must be within this many slots to be treated as simultaneous. */
-  readonly maxSkewSlots: number;
-  readonly nowMonoNs?: () => bigint;
-}
-
-export interface ApplyResult {
-  readonly accepted: boolean;
-  readonly reason: string | null;
-}
-
-export interface Readiness {
+export interface PairReadiness {
   readonly ready: boolean;
   readonly reason: ReasonCode;
   readonly detail: Record<string, unknown>;
 }
 
-export interface PoolStateView {
-  readonly pool: string;
-  readonly slot: number;
-  readonly coherence: 'COHERENT' | 'DEGRADED';
-  readonly ageMs: number | null;
-  readonly liquidity: string;
-  readonly tickIndex: number;
-  readonly reserveA: string | null;
-  readonly reserveB: string | null;
-  readonly invalidatedBy: string | null;
+export interface MarketFeedOptions {
+  readonly maxQuoteAgeMs: number;
+  /** Max slot difference allowed between the two legs of a route. */
+  readonly maxSkewSlots: number;
+  readonly nowUtc?: () => number;
 }
 
 export class MarketStateStore {
-  private readonly states = new Map<string, PoolSnapshot>();
-  private readonly invalidations = new Map<string, string>();
-  private readonly nowMono: () => bigint;
+  private readonly byPool = new Map<string, PoolSnapshot>();
+  private readonly invalidated = new Set<string>();
+  private readonly maxQuoteAgeMs: number;
+  private readonly maxSkewSlots: number;
+  private readonly nowUtc: () => number;
 
-  constructor(private readonly options: MarketStateOptions) {
-    if (options.maxQuoteAgeMs <= 0) throw new Error('maxQuoteAgeMs must be positive');
-    if (options.maxSkewSlots < 0) throw new Error('maxSkewSlots cannot be negative');
-    this.nowMono = options.nowMonoNs ?? nowMonoNs;
+  constructor(options: MarketFeedOptions) {
+    this.maxQuoteAgeMs = options.maxQuoteAgeMs;
+    this.maxSkewSlots = options.maxSkewSlots;
+    this.nowUtc = options.nowUtc ?? (() => Date.now());
   }
 
-  /**
-   * Apply a snapshot. Out-of-order updates are dropped: an older slot must never
-   * overwrite a newer one, or a delayed packet silently rewinds the feed.
-   */
-  apply(snapshot: PoolSnapshot): ApplyResult {
-    const existing = this.states.get(snapshot.poolAddress);
-    if (existing && snapshot.slot < existing.slot) {
-      return { accepted: false, reason: 'OUT_OF_ORDER' };
+  /** Apply a decoded snapshot. Older slots never overwrite newer state. */
+  apply(snapshot: PoolSnapshot): { accepted: boolean; reason?: string } {
+    const existing = this.byPool.get(snapshot.poolAddress);
+    if (existing && existing.slot > snapshot.slot) {
+      return { accepted: false, reason: 'OLDER_SLOT' };
     }
-    this.states.set(snapshot.poolAddress, snapshot);
-    // A good update lifts a decode/gap invalidation.
-    this.invalidations.delete(snapshot.poolAddress);
-    return { accepted: true, reason: null };
-  }
-
-  /** Mark a pool untrusted until its next good update. */
-  invalidate(poolAddress: string, reason: string): void {
-    this.invalidations.set(poolAddress, reason);
+    this.byPool.set(snapshot.poolAddress, snapshot);
+    this.invalidated.delete(snapshot.poolAddress);
+    return { accepted: true };
   }
 
   /**
-   * After a stream gap, no cached bytes can be proven contiguous, so every
-   * pool is quarantined. They re-enter service as fresh updates arrive.
+   * Mark a pool untrusted until fresh bytes arrive. Called when the transport
+   * reports a gap or a resubscribe: cached state is unprovable afterwards.
    */
-  invalidateAll(reason: string): void {
-    for (const poolAddress of this.states.keys()) this.invalidations.set(poolAddress, reason);
+  invalidate(poolAddress: string, why: string): void {
+    this.invalidated.add(poolAddress);
+    const snapshot = this.byPool.get(poolAddress);
+    if (snapshot) {
+      this.byPool.set(poolAddress, {
+        ...snapshot,
+        coherence: 'DEGRADED',
+        qualityFlags: [...new Set([...snapshot.qualityFlags, `INVALIDATED:${why}`])],
+      });
+    }
+  }
+
+  invalidateAll(why: string): void {
+    for (const poolAddress of [...this.byPool.keys()]) this.invalidate(poolAddress, why);
   }
 
   get(poolAddress: string): PoolSnapshot | undefined {
-    return this.states.get(poolAddress);
+    return this.byPool.get(poolAddress);
   }
 
-  ageMs(poolAddress: string): number | null {
-    const snapshot = this.states.get(poolAddress);
-    if (!snapshot) return null;
-    return Number(this.nowMono() - snapshot.observedMonoNs) / 1_000_000;
+  size(): number {
+    return this.byPool.size;
   }
 
   /**
-   * Decide whether a PAIR may be traded together. Ordered so the reported reason
-   * is the first real blocker: quarantine, then coherence, then freshness, then
-   * skew between the two legs.
+   * Whether two legs are simultaneously tradeable. This is the single gate the
+   * execution path uses, and it returns the reason rather than a bare boolean so
+   * the funnel stays explainable.
    */
-  readiness(poolA: string, poolB: string): Readiness {
-    for (const pool of [poolA, poolB]) {
-      const invalidation = this.invalidations.get(pool);
-      if (invalidation) {
-        return {
-          ready: false,
-          reason: invalidation === 'DECODE_ERROR' ? 'POOL_DEGRADED' : 'FEED_GAP',
-          detail: { pool, cause: invalidation },
-        };
-      }
-      const snapshot = this.states.get(pool);
-      if (!snapshot) return { ready: false, reason: 'FEED_STALE', detail: { pool, cause: 'NO_DATA' } };
-      if (snapshot.coherence !== 'COHERENT') {
-        return {
-          ready: false,
-          reason: 'POOL_DEGRADED',
-          detail: { pool, flags: snapshot.qualityFlags },
-        };
-      }
-      const age = this.ageMs(pool);
-      if (age === null || age > this.options.maxQuoteAgeMs) {
-        return {
-          ready: false,
-          reason: 'FEED_STALE',
-          detail: { pool, ageMs: age === null ? null : Math.round(age) },
-        };
-      }
+  readiness(poolA: string, poolB: string): PairReadiness {
+    const a = this.byPool.get(poolA);
+    const b = this.byPool.get(poolB);
+
+    if (!a || !b) {
+      return {
+        ready: false,
+        reason: 'FEED_STALE',
+        detail: { missing: [...(a ? [] : [poolA]), ...(b ? [] : [poolB])] },
+      };
+    }
+    if (this.invalidated.has(poolA) || this.invalidated.has(poolB)) {
+      return { ready: false, reason: 'FEED_GAP', detail: { pools: [poolA, poolB] } };
+    }
+    if (a.coherence !== 'COHERENT' || b.coherence !== 'COHERENT') {
+      return {
+        ready: false,
+        reason: 'POLICY_OR_CODE_DRIFT',
+        detail: { flagsA: a.qualityFlags, flagsB: b.qualityFlags },
+      };
     }
 
-    const a = this.states.get(poolA) as PoolSnapshot;
-    const b = this.states.get(poolB) as PoolSnapshot;
-    const skew = Math.abs(a.slot - b.slot);
-    if (skew > this.options.maxSkewSlots) {
-      return { ready: false, reason: 'FEED_GAP', detail: { skewSlots: skew } };
+    const now = this.nowUtc();
+    const ageA = now - Date.parse(a.observedAtUtc);
+    const ageB = now - Date.parse(b.observedAtUtc);
+    if (ageA > this.maxQuoteAgeMs || ageB > this.maxQuoteAgeMs) {
+      return {
+        ready: false,
+        reason: 'FEED_STALE',
+        detail: { ageA, ageB, maxQuoteAgeMs: this.maxQuoteAgeMs },
+      };
     }
-
-    return { ready: true, reason: 'OK', detail: { skewSlots: skew } };
+    if (Math.abs(a.slot - b.slot) > this.maxSkewSlots) {
+      return {
+        ready: false,
+        reason: 'FEED_GAP',
+        detail: { slotA: a.slot, slotB: b.slot, maxSkewSlots: this.maxSkewSlots },
+      };
+    }
+    return { ready: true, reason: 'OK', detail: { slotA: a.slot, slotB: b.slot } };
   }
 
-  snapshot(): PoolStateView[] {
-    return [...this.states.values()].map((snapshot) => ({
-      pool: snapshot.poolAddress,
-      slot: snapshot.slot,
-      coherence: snapshot.coherence,
-      ageMs: this.ageMs(snapshot.poolAddress),
-      liquidity: snapshot.liquidityRaw.toString(),
-      tickIndex: snapshot.tickIndex,
-      reserveA: snapshot.reserveA?.toString() ?? null,
-      reserveB: snapshot.reserveB?.toString() ?? null,
-      invalidatedBy: this.invalidations.get(snapshot.poolAddress) ?? null,
+  /** Observable freshness for /healthz and the operator dashboard. */
+  ageMs(poolAddress: string): number | null {
+    const snapshot = this.byPool.get(poolAddress);
+    return snapshot ? this.nowUtc() - Date.parse(snapshot.observedAtUtc) : null;
+  }
+
+  snapshot(): Array<Record<string, unknown>> {
+    return [...this.byPool.values()].map((p) => ({
+      pool: p.poolAddress,
+      slot: p.slot,
+      tickIndex: p.tickIndex,
+      liquidity: p.liquidityRaw.toString(),
+      feeRatePpm: p.feeRatePpm,
+      coherence: p.coherence,
+      flags: p.qualityFlags,
+      observedAtUtc: p.observedAtUtc,
+      ageMs: this.ageMs(p.poolAddress),
     }));
   }
 }

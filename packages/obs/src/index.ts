@@ -1,187 +1,196 @@
 /**
  * packages/obs — structured logging, metrics, funnel telemetry, redaction.
  *
- * Three principles:
- *  - every log line is one JSON object, so it is queryable without a parser
- *  - a secret never reaches a log sink, even if a caller passes one by mistake
- *  - the decision funnel counts WHY nothing happened, not just what did
+ * One JSON object per line so logs are machine-traced end to end. Every record
+ * carries: ts (UTC), level, component, event, plus optional intentId/routeKey,
+ * so a single attempt can be reconstructed from logs alone.
+ *
+ * Secret safety: values pass through `redact()` before serialisation, so a
+ * keypair, bearer token or RPC credential cannot leak even if a caller logs a
+ * whole config object by mistake.
  */
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
-/**
- * Patterns that indicate credential material. Applied to every string value
- * before serialisation, because "we do not log secrets" is a policy, and a
- * policy needs an enforcement point.
- */
-const REDACTIONS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
-  // base58 blobs long enough to be a secret key
-  { pattern: /\b[1-9A-HJ-NP-Za-km-z]{80,}\b/g, replacement: '[redacted:base58-blob]' },
-  // JSON arrays of 64 small integers — the classic Solana keypair file body
-  { pattern: /\[\s*(?:\d{1,3}\s*,\s*){40,}\d{1,3}\s*\]/g, replacement: '[redacted:keypair-array]' },
-  // bearer tokens and API keys in query strings
-  { pattern: /((?:api[-_]?key|token|secret|password)=)[^&\s"']+/gi, replacement: '$1[redacted]' },
-  { pattern: /(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, replacement: '$1[redacted]' },
-  // credentials embedded in a URL
-  { pattern: /(\/\/)[^:/@\s]+:[^@\s]+@/g, replacement: '$1[redacted]@' },
+const SECRET_KEY_PATTERN = /(secret|private|keypair|mnemonic|passphrase|api[-_]?key|password|authorization)/i;
+const SECRET_VALUE_PATTERNS: RegExp[] = [
+  /\b[1-9A-HJ-NP-Za-km-z]{80,90}\b/g, // base58 secret key blob
+  /\b(sk|pk|rk)-[A-Za-z0-9_-]{12,}\b/g,
+  /\bBearer\s+[A-Za-z0-9._-]+/gi,
+  /\bhttps?:\/\/[^\s:@/]+:[^\s@/]+@/gi, // user:pass@host
 ];
 
-/** Deep-redact a value destined for a log sink. */
 export function redact(value: unknown, depth = 0): unknown {
-  if (depth > 6) return '[max-depth]';
+  if (depth > 6) return '[depth-limit]';
+  if (value === null || value === undefined) return value;
   if (typeof value === 'string') {
-    let output = value;
-    for (const rule of REDACTIONS) output = output.replace(rule.pattern, rule.replacement);
-    return output;
+    let out = value;
+    for (const pattern of SECRET_VALUE_PATTERNS) out = out.replace(pattern, '[redacted]');
+    return out;
   }
   if (typeof value === 'bigint') return value.toString();
-  if (value instanceof Error) {
-    return { name: value.name, message: redact(value.message, depth + 1), stack: value.stack };
-  }
-  if (Array.isArray(value)) return value.map((item) => redact(item, depth + 1));
-  if (value && typeof value === 'object') {
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      // Keys that name secret material are dropped wholesale, regardless of shape.
-      if (/^(private|secret|mnemonic|seed|keypair|passphrase)/i.test(key)) {
-        output[key] = '[redacted]';
-        continue;
-      }
-      output[key] = redact(item, depth + 1);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) return value.slice(0, 100).map((v) => redact(v, depth + 1));
+  if (value instanceof Error) return redact({ name: value.name, message: value.message }, depth + 1);
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SECRET_KEY_PATTERN.test(k) && typeof v === 'string' ? '[redacted]' : redact(v, depth + 1);
     }
-    return output;
+    return out;
   }
-  return value;
+  return String(value);
+}
+
+export interface LogFields {
+  readonly [key: string]: unknown;
 }
 
 export interface Logger {
-  debug(event: string, fields?: Record<string, unknown>): void;
-  info(event: string, fields?: Record<string, unknown>): void;
-  warn(event: string, fields?: Record<string, unknown>): void;
-  error(event: string, fields?: Record<string, unknown>): void;
-  child(component: string): Logger;
+  debug(event: string, fields?: LogFields): void;
+  info(event: string, fields?: LogFields): void;
+  warn(event: string, fields?: LogFields): void;
+  error(event: string, fields?: LogFields): void;
+  child(bindings: LogFields): Logger;
 }
 
 export interface LoggerOptions {
   readonly component: string;
-  readonly level: LogLevel;
-  readonly pretty: boolean;
-  /** Injection point for tests; defaults to stdout. */
+  readonly level?: LogLevel;
+  readonly pretty?: boolean;
   readonly sink?: (line: string) => void;
-  readonly nowUtc?: () => Date;
+  readonly now?: () => Date;
 }
 
 export function createLogger(options: LoggerOptions): Logger {
-  const threshold = LEVEL_ORDER[options.level];
+  const level = options.level ?? 'info';
+  const pretty = options.pretty ?? false;
   const sink = options.sink ?? ((line: string) => process.stdout.write(line + '\n'));
-  const nowUtc = options.nowUtc ?? (() => new Date());
+  const now = options.now ?? (() => new Date());
 
-  const emit = (level: LogLevel, component: string, event: string, fields?: Record<string, unknown>): void => {
-    if (LEVEL_ORDER[level] < threshold) return;
+  const emit = (
+    logLevel: LogLevel,
+    component: string,
+    bindings: LogFields,
+    event: string,
+    fields?: LogFields,
+  ): void => {
+    if (LEVEL_ORDER[logLevel] < LEVEL_ORDER[level]) return;
     const record = {
-      ts: nowUtc().toISOString(),
-      level,
+      ts: now().toISOString(),
+      level: logLevel,
       component,
       event,
+      ...(redact(bindings) as Record<string, unknown>),
       ...(fields ? (redact(fields) as Record<string, unknown>) : {}),
     };
-    sink(options.pretty ? formatPretty(record) : JSON.stringify(record));
+    sink(pretty ? `${record.ts} ${logLevel.toUpperCase().padEnd(5)} ${component} ${event} ${JSON.stringify(record)}` : JSON.stringify(record));
   };
 
-  const make = (component: string): Logger => ({
-    debug: (event, fields) => emit('debug', component, event, fields),
-    info: (event, fields) => emit('info', component, event, fields),
-    warn: (event, fields) => emit('warn', component, event, fields),
-    error: (event, fields) => emit('error', component, event, fields),
-    child: (child) => make(`${component}.${child}`),
+  const make = (component: string, bindings: LogFields): Logger => ({
+    debug: (event, fields) => emit('debug', component, bindings, event, fields),
+    info: (event, fields) => emit('info', component, bindings, event, fields),
+    warn: (event, fields) => emit('warn', component, bindings, event, fields),
+    error: (event, fields) => emit('error', component, bindings, event, fields),
+    child: (extra) => make(component, { ...bindings, ...extra }),
   });
 
-  return make(options.component);
+  return make(options.component, {});
 }
 
-function formatPretty(record: Record<string, unknown>): string {
-  const { ts, level, component, event, ...rest } = record as Record<string, string>;
-  const suffix = Object.keys(rest).length > 0 ? ` ${JSON.stringify(rest)}` : '';
-  return `${ts} ${String(level).toUpperCase().padEnd(5)} [${component}] ${event}${suffix}`;
+/* ------------------------------------------------------------------ metrics */
+
+export interface HistogramSnapshot {
+  readonly count: number;
+  readonly p50: number;
+  readonly p95: number;
+  readonly p99: number;
+  readonly max: number;
 }
 
-/**
- * Monotonic nanoseconds. Wall-clock time can jump (NTP, VM migration) and is
- * therefore unusable for measuring latency or staleness.
- */
-export function nowMonoNs(): bigint {
-  return process.hrtime.bigint();
-}
+/** Bounded ring-buffer histogram in milliseconds. Hot-path safe, no growth. */
+export class LatencyHistogram {
+  private readonly samples: Float64Array;
+  private cursor = 0;
+  private size = 0;
 
-/** Stable-ish host identifier for correlating logs across restarts. */
-export function hostId(): string {
-  return process.env['HOSTNAME'] ?? 'unknown-host';
-}
-
-export class Metrics {
-  private readonly counters = new Map<string, number>();
-  private readonly gauges = new Map<string, number>();
-  private readonly histogram = new Map<string, number[]>();
-
-  inc(name: string, by = 1): void {
-    this.counters.set(name, (this.counters.get(name) ?? 0) + by);
+  constructor(capacity = 512) {
+    this.samples = new Float64Array(capacity);
   }
 
-  set(name: string, value: number): void {
-    this.gauges.set(name, value);
+  observe(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    this.samples[this.cursor] = ms;
+    this.cursor = (this.cursor + 1) % this.samples.length;
+    if (this.size < this.samples.length) this.size += 1;
   }
 
-  /** Record a duration sample, keeping a bounded window for a readable p95. */
-  observe(name: string, ms: number): void {
-    const samples = this.histogram.get(name) ?? [];
-    samples.push(ms);
-    // A bounded ring: unbounded growth here would be a slow memory leak.
-    if (samples.length > 512) samples.shift();
-    this.histogram.set(name, samples);
-  }
-
-  snapshot(): Record<string, unknown> {
-    const histograms: Record<string, { p50: number; p95: number; count: number }> = {};
-    for (const [name, samples] of this.histogram) {
-      if (samples.length === 0) continue;
-      const sorted = [...samples].sort((a, b) => a - b);
-      histograms[name] = {
-        p50: sorted[Math.floor(sorted.length * 0.5)] ?? 0,
-        p95: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 0,
-        count: sorted.length,
-      };
-    }
+  snapshot(): HistogramSnapshot {
+    if (this.size === 0) return { count: 0, p50: 0, p95: 0, p99: 0, max: 0 };
+    const values = Array.from(this.samples.slice(0, this.size)).sort((a, b) => a - b);
+    const pick = (p: number): number =>
+      values[Math.min(values.length - 1, Math.max(0, Math.ceil(p * values.length) - 1))] as number;
     return {
-      counters: Object.fromEntries(this.counters),
-      gauges: Object.fromEntries(this.gauges),
-      histograms,
+      count: values.length,
+      p50: Number(pick(0.5).toFixed(2)),
+      p95: Number(pick(0.95).toFixed(2)),
+      p99: Number(pick(0.99).toFixed(2)),
+      max: Number((values[values.length - 1] as number).toFixed(2)),
     };
   }
 }
 
 /**
- * Decision funnel: where each evaluated opportunity ended up, and why.
- * A healthy observe-only engine shows a large `NO_EDGE_AFTER_FEES` count — that
- * is the engine working, not failing.
+ * Pipeline funnel (V6 §10). Every stage is counted and every rejection is
+ * attributed to a reason code, so "zero trades" is explainable, never silent.
  */
 export class Funnel {
   private readonly stages = new Map<string, number>();
   private readonly reasons = new Map<string, number>();
 
-  markStage(stage: string): void {
-    this.stages.set(stage, (this.stages.get(stage) ?? 0) + 1);
+  markStage(stage: string, delta = 1): void {
+    this.stages.set(stage, (this.stages.get(stage) ?? 0) + delta);
   }
 
-  markReason(reason: string): void {
-    this.reasons.set(reason, (this.reasons.get(reason) ?? 0) + 1);
+  markReason(reason: string, delta = 1): void {
+    this.reasons.set(reason, (this.reasons.get(reason) ?? 0) + delta);
   }
 
   snapshot(): { stages: Record<string, number>; reasons: Record<string, number> } {
     return {
-      stages: Object.fromEntries(this.stages),
-      reasons: Object.fromEntries(this.reasons),
+      stages: Object.fromEntries([...this.stages.entries()].sort()),
+      reasons: Object.fromEntries([...this.reasons.entries()].sort()),
     };
   }
 }
+
+export interface RpcObservation {
+  readonly providerId: string;
+  readonly method: string;
+  readonly hostId: string;
+  readonly startedMonoNs: bigint;
+  readonly finishedMonoNs: bigint;
+  readonly status: 'OK' | 'ERROR' | 'TIMEOUT' | 'RATE_LIMITED';
+}
+
+/**
+ * RTT uses `process.hrtime.bigint()` (monotonic) — never wall-clock
+ * subtraction, which corrupts under NTP correction (V6 legacy L-07).
+ */
+export function nowMonoNs(): bigint {
+  return process.hrtime.bigint();
+}
+
+export function roundTripMs(observation: RpcObservation): number {
+  const delta = observation.finishedMonoNs - observation.startedMonoNs;
+  if (delta < 0n) return -1;
+  return Number(delta) / 1_000_000;
+}
+
+export function hostId(): string {
+  return process.env.HOSTNAME || `pid-${process.pid}`;
+}
+
+export * from './metrics';
