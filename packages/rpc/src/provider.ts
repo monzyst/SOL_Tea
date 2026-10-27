@@ -153,6 +153,59 @@ export class ProviderPool {
   }
 }
 
+/**
+ * A connection factory that FAILS OVER across providers on each attempt.
+ *
+ * Audit T07: the subscription layer was pinned to a single `RPC_WS_URL`, so the
+ * HTTP failover in ProviderPool was cosmetic — a dead websocket host meant a dead
+ * engine while HTTP reads kept succeeding and looked healthy. This factory walks
+ * the same rotation, so a reconnect advances to the next provider instead of
+ * retrying a host that is known to be down.
+ *
+ * The cursor advances once per connection attempt (not per healthy period), so a
+ * long-lived stream is never migrated mid-flight, which would lose slots.
+ */
+export class FailoverConnectionFactory {
+  private cursor = 0;
+
+  constructor(
+    private readonly pool: ProviderPool,
+    private readonly commitment: 'confirmed' | 'finalized',
+    private readonly logger: Logger,
+  ) {}
+
+  /** Provider id that the NEXT connection attempt will use. */
+  peekProviderId(): string {
+    const rotation = this.pool.rotation();
+    return (rotation[this.cursor % rotation.length] as ProviderState).config.id;
+  }
+
+  /** Build a Connection against the next provider in rotation. */
+  next(): { connection: Connection; wsUrl: string; providerId: string } {
+    const rotation = this.pool.rotation();
+    const state = rotation[this.cursor % rotation.length] as ProviderState;
+    this.cursor = (this.cursor + 1) % rotation.length;
+    this.logger.info('ws_provider_selected', {
+      providerId: state.config.id,
+      healthy: state.healthy,
+      rotationSize: rotation.length,
+    });
+    return {
+      connection: new Connection(state.config.httpUrl, {
+        commitment: this.commitment,
+        wsEndpoint: state.config.wsUrl,
+      }),
+      wsUrl: state.config.wsUrl,
+      providerId: state.config.id,
+    };
+  }
+
+  /** Reset to the head of rotation (e.g. after a full health recovery). */
+  reset(): void {
+    this.cursor = 0;
+  }
+}
+
 export function buildProviderConfigs(input: {
   httpUrl: string;
   wsUrl: string;
