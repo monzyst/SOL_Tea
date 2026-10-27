@@ -1,0 +1,35 @@
+{
+  "name": "sol-tea",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time Solana mainnet trading engine: event-driven pool intake, exact Whirlpool quoting, policy-gated execution and receipt reconciliation.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "main": "dist/apps/solana-worker/src/main.js",
+  "scripts": {
+    "dev": "tsx watch apps/solana-worker/src/main.ts",
+    "start": "node dist/apps/solana-worker/src/main.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/unit/*.test.ts",
+    "verify": "npm run typecheck && npm run test",
+    "check:config": "tsx scripts/check-config.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.31.1",
+    "@orca-so/common-sdk": "0.6.11",
+    "@orca-so/whirlpools-sdk": "0.22.0",
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.99.0",
+    "yaml": "2.9.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/bn.js": "5.2.0",
+    "@types/node": "20.19.43",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}
