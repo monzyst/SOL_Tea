@@ -1,118 +1,115 @@
 /**
  * packages/config — strict environment contract.
  *
- * Every field is validated once, at boot, and fails fast with the exact variable
- * name. There are no silent defaults for anything that can move money or point
- * at a network: a missing RPC URL is a startup error, not a fallback to a public
- * endpoint that happens to work in development.
+ * Every field is validated before the process touches the chain. There is no
+ * permissive default for anything that can move money: an empty
+ * WALLET_KEYPAIR_PATH is *valid* (observe-only mode) but cannot sign, and
+ * ENABLE_LIVE_EXECUTION must be explicitly "true" for any submission.
+ *
+ * Secrets are never read from a committed file: they come from the environment
+ * or from a path outside the repository (V6 §14).
  */
 
 import { z } from 'zod';
 
-export const LIVE_EXECUTION_OFF = 'false';
-
-const booleanString = z
+const boolish = z
   .string()
-  .trim()
-  .transform((value) => value.toLowerCase())
+  .transform((v) => v.trim().toLowerCase())
   .pipe(z.enum(['true', 'false']))
-  .transform((value) => value === 'true');
+  .transform((v) => v === 'true');
 
-const httpUrl = z
+const optionalUrl = z
   .string()
   .trim()
-  .min(1, 'must not be empty')
-  .refine((value) => value.startsWith('http://') || value.startsWith('https://'), {
-    message: 'must start with http:// or https://',
+  .optional()
+  .transform((v) => (v === undefined || v === '' ? undefined : v))
+  .refine((v) => v === undefined || /^(https|wss):\/\/.+/.test(v), {
+    message: 'must be empty or an absolute https/wss URL',
   });
 
-const wsUrl = z
-  .string()
-  .trim()
-  .min(1, 'must not be empty')
-  .refine((value) => value.startsWith('ws://') || value.startsWith('wss://'), {
-    message: 'must start with ws:// or wss://',
-  });
-
-export const envSchema = z
+export const EnvSchema = z
   .object({
-    RPC_HTTP_URL: httpUrl,
-    RPC_WS_URL: wsUrl,
-    // Empty string means "no secondary provider configured".
-    RPC_HTTP_URL_SECONDARY: z.string().trim().default(''),
-    RPC_WS_URL_SECONDARY: z.string().trim().default(''),
+    RPC_HTTP_URL: z
+      .string()
+      .trim()
+      .refine((v) => /^https:\/\/.+/.test(v), { message: 'RPC_HTTP_URL must be an https URL' }),
+    RPC_WS_URL: z
+      .string()
+      .trim()
+      .refine((v) => /^wss?:\/\/.+/.test(v), { message: 'RPC_WS_URL must be a ws(s) URL' }),
+    RPC_HTTP_URL_SECONDARY: optionalUrl,
+    RPC_WS_URL_SECONDARY: optionalUrl,
 
-    // Signer material is a PATH, never a key. Empty means observe-only.
     WALLET_KEYPAIR_PATH: z.string().trim().default(''),
     OPERATOR_PUBLIC_ADDRESS: z.string().trim().default(''),
 
-    SOL_TEA_CHAIN_CONFIG: z.string().trim().min(1).default('config/mainnet.solana.yaml'),
-    SOL_TEA_POLICY_CONFIG: z.string().trim().min(1).default('config/policy.solana.yaml'),
+    SOL_TEA_CHAIN_CONFIG: z.string().trim().default('config/mainnet.solana.yaml'),
+    SOL_TEA_POLICY_CONFIG: z.string().trim().default('config/policy.solana.yaml'),
 
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-    LOG_PRETTY: booleanString.default('false'),
+    LOG_PRETTY: boolish.default('false'),
     HEALTH_PORT: z.coerce.number().int().min(1).max(65_535).default(8787),
-    JOURNAL_DIR: z.string().trim().min(1).default('var/journal'),
+    JOURNAL_DIR: z.string().trim().default('var/journal'),
 
-    ENABLE_LIVE_EXECUTION: booleanString.default('false'),
-    EMERGENCY_PAUSE: booleanString.default('false'),
+    ENABLE_LIVE_EXECUTION: boolish.default('false'),
+    EMERGENCY_PAUSE: boolish.default('false'),
   })
-  .superRefine((value, ctx) => {
-    // A secondary provider is only useful if BOTH its endpoints are present.
-    const hasHttp = value.RPC_HTTP_URL_SECONDARY !== '';
-    const hasWs = value.RPC_WS_URL_SECONDARY !== '';
-    if (hasHttp !== hasWs) {
+  .superRefine((env, ctx) => {
+    // A secondary provider must be declared as a pair, otherwise failover would
+    // silently degrade to "the same backend twice".
+    if (!!env.RPC_HTTP_URL_SECONDARY !== !!env.RPC_WS_URL_SECONDARY) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: [hasHttp ? 'RPC_WS_URL_SECONDARY' : 'RPC_HTTP_URL_SECONDARY'],
-        message: 'secondary provider needs both RPC_HTTP_URL_SECONDARY and RPC_WS_URL_SECONDARY',
-      });
-    }
-    if (hasHttp && !/^https?:\/\//.test(value.RPC_HTTP_URL_SECONDARY)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        message: 'RPC_HTTP_URL_SECONDARY and RPC_WS_URL_SECONDARY must be set together',
         path: ['RPC_HTTP_URL_SECONDARY'],
-        message: 'must start with http:// or https://',
       });
     }
-    if (hasWs && !/^wss?:\/\//.test(value.RPC_WS_URL_SECONDARY)) {
+    if (env.RPC_HTTP_URL_SECONDARY && env.RPC_HTTP_URL_SECONDARY === env.RPC_HTTP_URL) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['RPC_WS_URL_SECONDARY'],
-        message: 'must start with ws:// or wss://',
+        message: 'secondary RPC must be a distinct endpoint, not the primary repeated',
+        path: ['RPC_HTTP_URL_SECONDARY'],
+      });
+    }
+    if (env.ENABLE_LIVE_EXECUTION && env.WALLET_KEYPAIR_PATH === '') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'ENABLE_LIVE_EXECUTION=true requires WALLET_KEYPAIR_PATH',
+        path: ['WALLET_KEYPAIR_PATH'],
+      });
+    }
+    // A keypair must never be loaded from inside the repository tree.
+    if (env.WALLET_KEYPAIR_PATH !== '' && !env.WALLET_KEYPAIR_PATH.startsWith('/')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'WALLET_KEYPAIR_PATH must be an absolute path outside the repository',
+        path: ['WALLET_KEYPAIR_PATH'],
       });
     }
   });
 
-export type Env = z.infer<typeof envSchema>;
+export type Env = z.infer<typeof EnvSchema>;
 
 export class ConfigError extends Error {
   constructor(
-    readonly section: string,
+    message: string,
     readonly issues: readonly string[],
   ) {
-    super(`${section} invalid:\n  - ${issues.join('\n  - ')}`);
+    super(`${message}: ${issues.join('; ')}`);
     this.name = 'ConfigError';
   }
 }
 
-/** Parse the process environment. Throws with every problem at once. */
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  const parsed = envSchema.safeParse(source);
+  const parsed = EnvSchema.safeParse(source);
   if (!parsed.success) {
-    throw new ConfigError(
-      'environment',
-      parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`),
-    );
+    const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
+    throw new ConfigError('invalid environment configuration', issues);
   }
   return parsed.data;
 }
 
-/**
- * Live signing needs BOTH the env switch and the chain switch, plus a resolved
- * policy (checked by the caller). Keeping this in one place means no code path
- * can accidentally decide it is live on its own.
- */
+/** Execution is possible only when live mode is on AND the emergency stop is clear. */
 export function executionAllowed(env: Env): boolean {
   return env.ENABLE_LIVE_EXECUTION && !env.EMERGENCY_PAUSE;
 }

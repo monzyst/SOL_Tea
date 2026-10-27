@@ -1,63 +1,82 @@
 /**
  * packages/config/dotenv — minimal, dependency-free .env loader.
  *
- * Node does not read .env by itself. Without this, `cp .env.example .env`
- * followed by `npm run dev` silently starts against the wrong configuration,
- * which is exactly the class of failure that looks like "the bot ignores my
- * settings".
+ * Node does not read .env by itself, and a process that boots to "RPC_HTTP_URL:
+ * Required" while a perfectly good .env sits in the working directory is a
+ * self-inflicted outage. This loader runs before validation and is deliberately
+ * conservative:
  *
- * Deliberate behaviour:
- *  - a real environment variable ALWAYS wins over the file
- *  - a missing .env is normal (production uses real env vars)
- *  - nothing is logged at info level: values are not a log concern
+ *  - it never overwrites a variable already present in the real environment
+ *    (so container/orchestrator secrets always win over a stray file),
+ *  - it is silent when the file is absent (CI and production set real env vars),
+ *  - it supports the quoting styles .env files actually use.
+ *
+ * Committed config must never depend on this: `.env` is git-ignored and only
+ * carries local/operator overrides.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 
-export interface DotEnvResult {
-  readonly loaded: boolean;
-  readonly path: string;
-  /** Variable names applied from the file (never their values). */
-  readonly appliedKeys: readonly string[];
-}
+/** Parse .env text into key/value pairs without touching the environment. */
+export function parseDotEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
 
-/** Strip one layer of matching quotes from a raw value. */
-function unquote(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2) {
-    const first = trimmed[0];
-    const last = trimmed[trimmed.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      const inner = trimmed.slice(1, -1);
-      return first === '"' ? inner.replace(/\\n/g, '\n') : inner;
-    }
-  }
-  return trimmed;
-}
-
-export function loadDotEnv(path = resolve(process.cwd(), '.env')): DotEnvResult {
-  if (!existsSync(path)) return { loaded: false, path, appliedKeys: [] };
-
-  const appliedKeys: string[] = [];
-  for (const rawLine of readFileSync(path, 'utf8').split(/\r?\n/)) {
+  for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === '' || line.startsWith('#')) continue;
 
-    const separator = line.indexOf('=');
-    if (separator <= 0) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
 
-    const key = line.slice(0, separator).trim();
-    // Only a conservative identifier charset; anything else is not a variable.
-    if (!/^[A-Z_][A-Z0-9_]*$/i.test(key)) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
 
-    // Real environment variables take precedence, so a stale .env can never
-    // override what the orchestrator injected.
-    if (process.env[key] !== undefined) continue;
+    let value = line.slice(eq + 1).trim();
 
-    process.env[key] = unquote(line.slice(separator + 1));
-    appliedKeys.push(key);
+    // Strip an inline comment only when the value is unquoted.
+    if (!/^["']/.test(value)) {
+      const hash = value.indexOf(' #');
+      if (hash > 0) value = value.slice(0, hash).trim();
+    }
+
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    out[key] = value;
   }
 
-  return { loaded: true, path, appliedKeys };
+  return out;
+}
+
+/**
+ * Load a .env file into `env` without overriding anything already set.
+ * Returns the keys that were applied, so startup can log them (never values).
+ */
+export function loadDotEnv(
+  filePath = '.env',
+  env: NodeJS.ProcessEnv = process.env,
+): { loaded: boolean; appliedKeys: string[] } {
+  if (!existsSync(filePath)) return { loaded: false, appliedKeys: [] };
+
+  let parsed: Record<string, string>;
+  try {
+    parsed = parseDotEnv(readFileSync(filePath, 'utf8'));
+  } catch {
+    // An unreadable .env must not be silently ignored: the caller validates the
+    // environment next and will report the missing variables explicitly.
+    return { loaded: false, appliedKeys: [] };
+  }
+
+  const appliedKeys: string[] = [];
+  for (const [key, value] of Object.entries(parsed)) {
+    if (env[key] === undefined) {
+      env[key] = value;
+      appliedKeys.push(key);
+    }
+  }
+  return { loaded: true, appliedKeys };
 }

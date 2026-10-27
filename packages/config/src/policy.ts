@@ -1,129 +1,130 @@
 /**
  * packages/config/policy — signed financial policy (config/policy.solana.yaml).
  *
- * The distinction that matters: `REQUIRED_OWNER_BINDING` is NOT a default. It is
- * an explicit statement that the owner has not yet authorised this lane. The
- * validator accepts the file so the engine can boot observe-only, and
- * `unresolvedPolicyFields` reports exactly what is missing. Nothing here ever
- * guesses a capital limit — guessing a position size is how an engine loses
- * money while looking correctly configured.
+ * Every numeric bound here is an owner decision. The code refuses to run a live
+ * lane while any bound is still `REQUIRED_OWNER_BINDING`, and the reservation
+ * ledger enforces them on every attempt (V6 §06).
  */
 
-import { readFileSync } from 'node:fs';
-import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { ConfigError } from './env';
-import { REQUIRED } from './chain';
+import { readFileSync } from 'node:fs';
+import YAML from 'yaml';
+import { UNRESOLVED } from './chain';
 
-/** A bound is either an explicit integer or the explicit "not yet decided" mark. */
-const bound = z.union([z.literal(REQUIRED), z.number().int().min(0)]);
+/** Accepts either a resolved non-negative integer (or digit string) or the placeholder. */
+const ownerBound = z.union([
+  z.literal(UNRESOLVED),
+  z.number().int().nonnegative(),
+  z
+    .string()
+    .regex(/^[0-9]+$/, 'must be a non-negative integer string')
+    .transform((v) => Number(v)),
+]);
 
-const boundWithUnit = z.object({
-  value: bound,
-  unit: z.enum(['RAW', 'LAMPORTS', 'BPS', 'MS', 'UTC', 'COUNT']),
-});
-
-export const policySchema = z.object({
-  schemaVersion: z.literal('v6.0'),
-  solArb: z.object({
-    maxBorrowRaw: bound,
-    minPrincipalRawPerAttempt: bound,
-    maxPrincipalRawPerAttempt: bound,
-    minOnchainSurplusRaw: bound,
-    minEconomicNetRaw: bound,
-    maxSlippageBps: z.number().int().min(0).max(2_000),
-    maxNativeFeePerAttemptLamports: bound,
-    maxNativeFeePeriodLamports: bound,
-    periodStartUtc: z.union([z.literal(REQUIRED), z.string().datetime({ offset: true })]),
-    maxConcurrentPending: bound,
-    routeCooldownMs: z.number().int().min(0),
-    maxConsecutiveFailures: z.number().int().min(1),
-  }),
-  accounting: z.object({
-    reportingCurrency: z.string().min(1),
-    rounding: z.object({
-      cost: z.literal('CEILING'),
-      proceeds: z.literal('FLOOR'),
+export const PolicySchema = z
+  .object({
+    schemaVersion: z.literal('v6.0'),
+    solArb: z.object({
+      maxBorrowRaw: ownerBound,
+      maxPrincipalRawPerAttempt: ownerBound,
+      minPrincipalRawPerAttempt: ownerBound,
+      minOnchainSurplusRaw: ownerBound,
+      minEconomicNetRaw: ownerBound,
+      maxSlippageBps: z.number().int().min(0).max(2_000),
+      maxNativeFeePerAttemptLamports: ownerBound,
+      maxNativeFeePeriodLamports: ownerBound,
+      periodStartUtc: z.string(),
+      maxConcurrentPending: ownerBound,
+      // Cool-down after a failed/unknown attempt on the same route.
+      routeCooldownMs: z.number().int().min(0).max(600_000),
+      // Repeated failures quarantine a route rather than burning fees.
+      maxConsecutiveFailures: z.number().int().min(1).max(100),
     }),
-  }),
-  control: z.object({
-    pauseFile: z.string().min(1),
-    maxDailyLossRaw: bound,
-  }),
-});
+    accounting: z.object({
+      reportingCurrency: z.string().min(1),
+      rounding: z.object({
+        cost: z.literal('CEILING'),
+        proceeds: z.literal('FLOOR'),
+      }),
+    }),
+    control: z.object({
+      pauseFile: z.string().min(1),
+      maxDailyLossRaw: ownerBound,
+    }),
+  })
+  .superRefine((cfg, ctx) => {
+    const p = cfg.solArb;
+    if (typeof p.maxBorrowRaw === 'number' && typeof p.maxPrincipalRawPerAttempt === 'number') {
+      if (p.maxPrincipalRawPerAttempt > p.maxBorrowRaw) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'maxPrincipalRawPerAttempt cannot exceed maxBorrowRaw',
+          path: ['solArb', 'maxPrincipalRawPerAttempt'],
+        });
+      }
+    }
+    if (
+      typeof p.minPrincipalRawPerAttempt === 'number' &&
+      typeof p.maxPrincipalRawPerAttempt === 'number' &&
+      p.minPrincipalRawPerAttempt > p.maxPrincipalRawPerAttempt
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'minPrincipalRawPerAttempt exceeds maxPrincipalRawPerAttempt',
+        path: ['solArb', 'minPrincipalRawPerAttempt'],
+      });
+    }
+    if (
+      typeof p.maxNativeFeePerAttemptLamports === 'number' &&
+      typeof p.maxNativeFeePeriodLamports === 'number' &&
+      p.maxNativeFeePerAttemptLamports > p.maxNativeFeePeriodLamports
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'per-attempt fee cap exceeds the per-period cap',
+        path: ['solArb', 'maxNativeFeePerAttemptLamports'],
+      });
+    }
+    if (p.periodStartUtc !== UNRESOLVED && Number.isNaN(Date.parse(p.periodStartUtc))) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'periodStartUtc must be an ISO-8601 UTC timestamp',
+        path: ['solArb', 'periodStartUtc'],
+      });
+    }
+  });
 
-export type Policy = z.infer<typeof policySchema>;
+export type Policy = z.infer<typeof PolicySchema>;
+
+export function parsePolicy(raw: unknown): Policy {
+  const parsed = PolicySchema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
+    throw new Error(`invalid policy config: ${issues.join('; ')}`);
+  }
+  return parsed.data;
+}
 
 export function loadPolicy(path: string): Policy {
-  let raw: unknown;
-  try {
-    raw = parseYaml(readFileSync(path, 'utf8'));
-  } catch (error) {
-    throw new ConfigError('policy-config', [`cannot read ${path}: ${(error as Error).message}`]);
-  }
-
-  const parsed = policySchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new ConfigError(
-      'policy-config',
-      parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`),
-    );
-  }
-
-  const policy = parsed.data;
-  const issues: string[] = [];
-
-  // A structurally impossible policy is rejected even in observe-only mode:
-  // these describe relationships, not amounts, so no owner decision is implied.
-  if (
-    typeof policy.solArb.minPrincipalRawPerAttempt === 'number' &&
-    typeof policy.solArb.maxPrincipalRawPerAttempt === 'number' &&
-    policy.solArb.minPrincipalRawPerAttempt > policy.solArb.maxPrincipalRawPerAttempt
-  ) {
-    issues.push('solArb.minPrincipalRawPerAttempt: must be <= maxPrincipalRawPerAttempt');
-  }
-  if (
-    typeof policy.solArb.maxNativeFeePerAttemptLamports === 'number' &&
-    typeof policy.solArb.maxNativeFeePeriodLamports === 'number' &&
-    policy.solArb.maxNativeFeePerAttemptLamports > policy.solArb.maxNativeFeePeriodLamports
-  ) {
-    issues.push(
-      'solArb.maxNativeFeePerAttemptLamports: cannot exceed maxNativeFeePeriodLamports',
-    );
-  }
-  if (policy.solArb.maxConcurrentPending === 0) {
-    issues.push('solArb.maxConcurrentPending: a zero limit would make the engine inert');
-  }
-
-  if (issues.length > 0) throw new ConfigError('policy-config', issues);
-  return policy;
+  const text = readFileSync(path, 'utf8');
+  return parsePolicy(YAML.parse(text));
 }
 
-/** Every field still marked REQUIRED_OWNER_BINDING, in a stable order. */
+/** Every money-moving bound must be resolved before live signing is possible. */
 export function unresolvedPolicyFields(policy: Policy): string[] {
-  const fields: string[] = [];
-  const check = (name: string, value: unknown): void => {
-    if (value === REQUIRED) fields.push(name);
-  };
-
-  check('solArb.maxBorrowRaw', policy.solArb.maxBorrowRaw);
-  check('solArb.minPrincipalRawPerAttempt', policy.solArb.minPrincipalRawPerAttempt);
-  check('solArb.maxPrincipalRawPerAttempt', policy.solArb.maxPrincipalRawPerAttempt);
-  check('solArb.minOnchainSurplusRaw', policy.solArb.minOnchainSurplusRaw);
-  check('solArb.minEconomicNetRaw', policy.solArb.minEconomicNetRaw);
-  check('solArb.maxNativeFeePerAttemptLamports', policy.solArb.maxNativeFeePerAttemptLamports);
-  check('solArb.maxNativeFeePeriodLamports', policy.solArb.maxNativeFeePeriodLamports);
-  check('solArb.periodStartUtc', policy.solArb.periodStartUtc);
-  check('solArb.maxConcurrentPending', policy.solArb.maxConcurrentPending);
-  check('control.maxDailyLossRaw', policy.control.maxDailyLossRaw);
-
-  return fields;
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(policy.solArb)) {
+    if (value === UNRESOLVED) out.push(`solArb.${key}`);
+  }
+  for (const [key, value] of Object.entries(policy.control)) {
+    if (value === UNRESOLVED) out.push(`control.${key}`);
+  }
+  return out;
 }
 
-/** Read an integer bound that the caller has already proven to be resolved. */
 export function resolvedNumber(value: number | string, field: string): number {
   if (typeof value !== 'number') {
-    throw new ConfigError('policy-config', [`${field}: still unresolved (${String(value)})`]);
+    throw new Error(`${field} is unresolved (${UNRESOLVED}); owner binding required before live execution`);
   }
   return value;
 }

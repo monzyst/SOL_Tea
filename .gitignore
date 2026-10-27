@@ -14,9 +14,9 @@ wallet*.json
 credentials*
 service-account*.json
 
-# --- runtime state ---
-var/
-journal/
+# --- runtime state (anchored: do NOT ignore packages/journal/) ---
+/var/
+/journal/
 *.jsonl
 *.sqlite
 *.sqlite3
