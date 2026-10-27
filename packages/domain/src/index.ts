@@ -112,6 +112,39 @@ export function scaleDecimalsCeil(raw: bigint, sourceDecimals: number, targetDec
   return raw === 0n ? 0n : (raw + d - 1n) / d;
 }
 
+/** Open a base58 encoder/decoder here so no module re-implements it. */
+const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/** Encode raw bytes as base58 (Solana wire format for keys and signatures). */
+export function encodeBase58(bytes: Uint8Array): string {
+  let num = 0n;
+  for (const byte of bytes) num = num * 256n + BigInt(byte);
+  let out = '';
+  while (num > 0n) {
+    out = (B58_ALPHABET[Number(num % 58n)] as string) + out;
+    num /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    out = '1' + out;
+  }
+  return out === '' ? '1' : out;
+}
+
+/** Decode base58 into bytes. Rejects characters outside the alphabet. */
+export function decodeBase58(value: string): Buffer {
+  let num = 0n;
+  for (const char of value) {
+    const index = B58_ALPHABET.indexOf(char);
+    if (index < 0) throw new DomainError('INVALID_BASE58', `invalid base58 character: ${char}`);
+    num = num * 58n + BigInt(index);
+  }
+  const hex = num === 0n ? '' : num.toString(16);
+  const bytes = Buffer.from(hex.length % 2 === 0 ? hex : `0${hex}`, 'hex');
+  const leadingZeros = value.length - value.replace(/^1+/, '').length;
+  return Buffer.concat([Buffer.alloc(leadingZeros), bytes]);
+}
+
 /**
  * Route identity: exactly two distinct pools forming a closed asset cycle.
  * A venue name alone is never a route (V6 §01.1).
@@ -158,10 +191,20 @@ export type ReasonCode =
   | 'FEE_LIMIT_REACHED'
   | 'MAX_CONCURRENT_PENDING'
   | 'PAUSED'
+  /** Economics passed but this process is not armed to submit. */
+  | 'LIVE_EXECUTION_DISARMED'
   | 'GAS_BELOW_BOOTSTRAP_FLOOR'
   | 'TX_OUTCOME_UNKNOWN'
   | 'COOLDOWN_AFTER_FAILURE'
-  | 'POLICY_OR_CODE_DRIFT';
+  | 'POLICY_OR_CODE_DRIFT'
+  /** Fee estimator has no fresh sample and cannot price the attempt. */
+  | 'FEE_ESTIMATE_UNAVAILABLE'
+  /** Route would cross a liquidity boundary the quote cannot model. */
+  | 'TICK_BOUNDARY_CROSSED'
+  /** Venue state disagrees with the qualified binding (mints/fee/spacing). */
+  | 'VENUE_STATE_DRIFT'
+  /** Reference table is stale/short, so the route is unpriceable. */
+  | 'LIQUIDITY_UNREFERENCED';
 
 export type AttemptState =
   | 'DISCOVERED'
@@ -169,8 +212,10 @@ export type AttemptState =
   | 'ADMITTED'
   | 'RESERVED'
   | 'SIGNED'
+  | 'SUBMITTING'
   | 'SUBMITTED'
   | 'INCLUDED'
+  | 'AWAITING_FINALITY'
   | 'FINALIZED'
   | 'RECONCILED'
   | 'REJECTED'

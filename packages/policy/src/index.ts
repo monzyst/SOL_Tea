@@ -27,7 +27,11 @@ export interface AdmissionInput {
   readonly lastFailureAtUtc: string | null;
   readonly nowUtc: Date;
   readonly paused: boolean;
-  readonly liveExecutionEnabled: boolean;
+  /**
+   * True only when execution is armed for this process. False in observe mode.
+   * Kept separate from `paused` so the two states are never conflated in logs.
+   */
+  readonly executionArmed: boolean;
 }
 
 export interface AdmissionDecision {
@@ -37,17 +41,30 @@ export interface AdmissionDecision {
 }
 
 /**
- * Deterministic admission. Safety gates run first, then economics, so a
- * rejection always names the *first* true blocker.
+ * Deterministic admission.
+ *
+ * ORDER MATTERS, and the order is the whole design:
+ *
+ *   1. Operator pause (a human decision) ...
+ *   2. Policy completeness (fail closed on unresolved money values) ...
+ *   3. Route health, concurrency, size, economics, fee caps ...
+ *   4. Arming — "is execution switched on right now?" comes LAST.
+ *
+ * Arming is deliberately last because it is not an economic input. If it ran
+ * first, observe-only mode would return PAUSED for every opportunity and the
+ * engine would never evaluate a single quote — the mode would prove nothing, and
+ * a dashboard would show an operator pause that no operator caused. Evaluating
+ * economics first means observation produces the real verdict (NO_EDGE_AFTER_FEES,
+ * FEE_LIMIT_REACHED, ...) and, when everything passes and we are simply not armed,
+ * says so distinctly as LIVE_EXECUTION_DISARMED.
+ *
+ * A rejection always names the FIRST true blocker encountered in that order.
  */
 export function admitOpportunity(input: AdmissionInput): AdmissionDecision {
   const p = input.policy.solArb;
 
   if (input.paused) {
     return { admitted: false, reason: 'PAUSED', detail: { source: 'emergency-or-file' } };
-  }
-  if (!input.liveExecutionEnabled) {
-    return { admitted: false, reason: 'PAUSED', detail: { source: 'live-execution-disabled' } };
   }
 
   const unresolved = unresolvedPolicyFields(input.policy);
@@ -100,6 +117,8 @@ export function admitOpportunity(input: AdmissionInput): AdmissionDecision {
     return {
       admitted: false,
       reason: 'SIZE_BELOW_MINIMUM',
+      // Deliberately the same reason as "too small": both mean the size is
+      // outside the signed band, and the detail names which bound was crossed.
       detail: { principalRaw: input.principalRaw.toString(), maxPrincipal: maxPrincipal.toString() },
     };
   }
@@ -131,6 +150,21 @@ export function admitOpportunity(input: AdmissionInput): AdmissionDecision {
       detail: {
         worstCaseNativeFeeRaw: input.worstCaseNativeFeeRaw.toString(),
         perAttemptCap: perAttemptCap.toString(),
+      },
+    };
+  }
+
+  // Economics pass. Only now does it matter whether execution is switched on.
+  if (!input.executionArmed) {
+    return {
+      admitted: false,
+      reason: 'LIVE_EXECUTION_DISARMED',
+      // wouldAdmit:true is the observable proof of what observation measured: the
+      // opportunity cleared every economic gate and was stopped only by arming.
+      detail: {
+        wouldAdmit: true,
+        grossSurplusRaw: input.grossSurplusRaw.toString(),
+        worstCaseNativeFeeRaw: input.worstCaseNativeFeeRaw.toString(),
       },
     };
   }
