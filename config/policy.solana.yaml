@@ -1,0 +1,46 @@
+# SOL_Tea — financial policy (owner decisions, not code defaults).
+#
+# Every `REQUIRED_OWNER_BINDING` must be replaced with a real number by the owner
+# before live signing is possible; until then the engine runs observe-only and
+# admission reports POLICY_OR_CODE_DRIFT. Values are in base units of the
+# settlement asset (USDC = 6 decimals) unless the name says Lamports.
+schemaVersion: v6.0
+
+solArb:
+  # --- capital bounds ---
+  maxBorrowRaw: REQUIRED_OWNER_BINDING
+  minPrincipalRawPerAttempt: REQUIRED_OWNER_BINDING
+  maxPrincipalRawPerAttempt: REQUIRED_OWNER_BINDING
+
+  # --- economic floors ---
+  # Minimum surplus that must be visible on chain before we consider a cycle.
+  minOnchainSurplusRaw: REQUIRED_OWNER_BINDING
+  # Minimum surplus after ALL costs (fees, priority fee, rent). Stricter.
+  minEconomicNetRaw: REQUIRED_OWNER_BINDING
+
+  # --- slippage & fees ---
+  maxSlippageBps: 30
+  # Native fee (lamports) ceilings, per attempt and per period.
+  maxNativeFeePerAttemptLamports: REQUIRED_OWNER_BINDING
+  maxNativeFeePeriodLamports: REQUIRED_OWNER_BINDING
+  periodStartUtc: REQUIRED_OWNER_BINDING
+
+  # --- concurrency & route health ---
+  maxConcurrentPending: REQUIRED_OWNER_BINDING
+  # Cool-down after a failed or unknown attempt on the same route.
+  routeCooldownMs: 15000
+  # Repeated failures quarantine the route instead of burning fees.
+  maxConsecutiveFailures: 3
+
+accounting:
+  reportingCurrency: USDC
+  rounding:
+    # Costs always round up, proceeds always round down.
+    cost: CEILING
+    proceeds: FLOOR
+
+control:
+  # Presence of this file pauses new signing. Checked on every evaluation.
+  pauseFile: var/PAUSE
+  # Daily realised loss ceiling (absolute, settlement base units).
+  maxDailyLossRaw: REQUIRED_OWNER_BINDING
