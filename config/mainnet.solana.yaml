@@ -1,0 +1,63 @@
+# SOL_Tea — Solana mainnet binding.
+#
+# `REQUIRED_OWNER_BINDING` is a hard placeholder: validation refuses to start a
+# live lane while any remain. Filling one in is an explicit owner action, never a
+# silent default. No secret material belongs in this file.
+schemaVersion: v6.0
+
+chain:
+  # Solana mainnet-beta genesis hash (verify with RPC getGenesisHash).
+  genesisHash: 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
+  # Master switch. Keep false until the PRE-LIVE gate is signed off.
+  enabled: false
+  # Settlement asset for the cycle: USDC.
+  settlementMint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  txFormat: v0
+  # `confirmed` is the fastest commitment still safe to build on.
+  commitment: confirmed
+
+lender:
+  # Flash liquidity provider. Disabled: no live program proof in this release.
+  kind: JUPITER_LEND
+  programId: REQUIRED_OWNER_BINDING
+  sdkVersion: 0.0.0-unpinned
+  enabled: false
+
+executor:
+  # Public address only. The keypair lives outside the repo (WALLET_KEYPAIR_PATH).
+  operatorPublicAddress: REQUIRED_OWNER_BINDING
+  treasuryAddress: REQUIRED_OWNER_BINDING
+  # Two Whirlpool swaps + ATA setup + compute budget fit comfortably here.
+  maxComputeUnits: 400000
+  # Priority fee in micro-lamports per compute unit. Mainnet tuning is TBD.
+  priorityFeeMicroLamports: 1000
+
+market:
+  # Orca Whirlpool program (mainnet).
+  programId: whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc
+  # Two DISTINCT WSOL/USDC pools are required to form a closed cycle.
+  pools:
+    - address: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+      mintA: So11111111111111111111111111111111111111112
+      mintB: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+      decimalsA: 9
+      decimalsB: 6
+      tickSpacing: 4
+      feeRatePpm: 400
+    - address: 7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm
+      mintA: So11111111111111111111111111111111111111112
+      mintB: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+      decimalsA: 9
+      decimalsB: 6
+      tickSpacing: 8
+      feeRatePpm: 500
+  # A quote older than this is never used to build a transaction.
+  maxQuoteAgeMs: 2000
+  reconnectBaseMs: 500
+  reconnectMaxMs: 30000
+  healthCheckIntervalMs: 5000
+
+control:
+  # Presence of this file pauses NEW signing (fail-safe).
+  independentEmergencyStop: var/PAUSE
+  alertTargetRef: REQUIRED_OWNER_BINDING
