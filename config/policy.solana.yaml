@@ -1,36 +1,90 @@
-# SOL_Tea — financial policy (owner decisions, not code defaults).
+# SOL_Tea — financial policy.
 #
-# Every `REQUIRED_OWNER_BINDING` must be replaced with a real number by the owner
-# before live signing is possible; until then the engine runs observe-only and
-# admission reports POLICY_OR_CODE_DRIFT. Values are in base units of the
-# settlement asset (USDC = 6 decimals) unless the name says Lamports.
+# These are CONSERVATIVE FIRST-LIVE CAPS supplied as defaults, not code magic
+# numbers. Every value below is owner-tunable: change it here, keep the shape,
+# and `npm run check:config` validates the result before the process starts.
+#
+# Design intent of these defaults: the first live run should be able to LOSE at
+# most a few dollars while proving the pipeline end-to-end. They are sized so a
+# total software failure (every attempt reverts, every fee is burned) costs cents
+# rather than dollars. Raise them only after real reconciled evidence.
+#
+# Units: settlement asset base units (USDC = 6 decimals) unless the name says
+# Lamports. 1 USDC = 1_000_000 raw.
 schemaVersion: v6.0
 
+# Provenance of these numbers, recorded so a future reader can tell an owner
+# decision from a stale experiment.
+defaultsProfile:
+  name: first-live-conservative
+  authored: "2026-10-27"
+  rationale: >-
+    Sized for a first mainnet observation-to-execution transition. Capital per
+    attempt is $5, the daily loss ceiling is $2, and the fee budgets allow roughly
+    40 attempts per day at a typical priority fee. Every bound is overridable.
+  ownerTunable: true
+
 solArb:
-  # --- capital bounds ---
-  maxBorrowRaw: REQUIRED_OWNER_BINDING
-  minPrincipalRawPerAttempt: REQUIRED_OWNER_BINDING
-  maxPrincipalRawPerAttempt: REQUIRED_OWNER_BINDING
+  # --- capital bounds ------------------------------------------------
+  # Maximum we would ever borrow for a single attempt. Flash-funded, so this is
+  # exposure-per-attempt, not balance-at-risk: an attempt that cannot be repaid
+  # atomically never lands.
+  maxBorrowRaw: 5000000            # 5.000000 USDC
+  # Smallest attempt worth the fixed fees. Below this the base fee dominates.
+  minPrincipalRawPerAttempt: 500000    # 0.500000 USDC
+  maxPrincipalRawPerAttempt: 5000000   # 5.000000 USDC
 
-  # --- economic floors ---
-  # Minimum surplus that must be visible on chain before we consider a cycle.
-  minOnchainSurplusRaw: REQUIRED_OWNER_BINDING
-  # Minimum surplus after ALL costs (fees, priority fee, rent). Stricter.
-  minEconomicNetRaw: REQUIRED_OWNER_BINDING
+  # --- economic floors ----------------------------------------------
+  # Surplus that must be visible on chain before an attempt is considered.
+  # 10_000 raw = $0.01 — deliberately above dust.
+  minOnchainSurplusRaw: 10000
+  # Surplus required AFTER all costs (fees, priority fee, lender fee). Stricter
+  # than the on-chain floor: this is the number that must be positive to trade.
+  minEconomicNetRaw: 25000         # $0.025
 
-  # --- slippage & fees ---
-  maxSlippageBps: 30
-  # Native fee (lamports) ceilings, per attempt and per period.
-  maxNativeFeePerAttemptLamports: REQUIRED_OWNER_BINDING
-  maxNativeFeePeriodLamports: REQUIRED_OWNER_BINDING
-  periodStartUtc: REQUIRED_OWNER_BINDING
+  # --- slippage & fees ----------------------------------------------
+  maxSlippageBps: 30               # 0.30% per leg
+  # Native fee ceilings, per attempt and per rolling period.
+  # 300_000 lamports ≈ 0.0003 SOL ≈ $0.06 at a $200 SOL — room for a 400k CU
+  # attempt at a 500 micro-lamport/CU priority fee plus two ATA creations.
+  maxNativeFeePerAttemptLamports: 300000
+  maxNativeFeePeriodLamports: 6000000   # ≈ 20 attempts at the per-attempt cap
+  # Start of the fee period (UTC). Move this forward to open a fresh budget.
+  periodStartUtc: "2026-10-27T00:00:00Z"
 
-  # --- concurrency & route health ---
-  maxConcurrentPending: REQUIRED_OWNER_BINDING
+  # --- concurrency & route health -----------------------------------
+  # One in-flight attempt: with a single operator wallet, a second concurrent
+  # attempt competes for the same accounts and can only add revert risk.
+  maxConcurrentPending: 1
   # Cool-down after a failed or unknown attempt on the same route.
   routeCooldownMs: 15000
   # Repeated failures quarantine the route instead of burning fees.
   maxConsecutiveFailures: 3
+  # How long a quarantined route stays out of rotation.
+  routeQuarantineMs: 600000        # 10 minutes
+
+  # --- flash funding ------------------------------------------------
+  # Lender fee assumed for the economic test. Kept at 0 because the lender is
+  # unproven in this release and a fake fee would make quotes look worse than
+  # they are; the composition module recomputes the real bound when a lender is
+  # bound. MUST be updated when `lender.enabled` becomes true.
+  lenderFeeBps: 0
+
+  # --- priority fee policy -------------------------------------------
+  # Adaptive estimation replaces the old static constant. The estimator bids at
+  # a percentile of recently observed fees, then clamps into [floor, ceiling].
+  priorityFee:
+    # Bid at this percentile of recent samples. p50 tracks the median inclusion
+    # cost; p75 buys headroom in a rising market. The default favours inclusion
+    # certainty over the last few hundred lamports.
+    percentile: 0.75
+    floorMicroLamports: 1000       # never bid below this; a 0 bid is deprioritised
+    ceilingMicroLamports: 150000   # hard cap, also enforced by admission
+    # Fewer than this many non-zero samples => refuse to guess.
+    minSamples: 8
+    ttlMs: 15000
+    # Fallback when the chain is quiet (no samples). null = refuse the attempt.
+    fallbackMicroLamports: 2000
 
 accounting:
   reportingCurrency: USDC
@@ -42,5 +96,15 @@ accounting:
 control:
   # Presence of this file pauses new signing. Checked on every evaluation.
   pauseFile: var/PAUSE
-  # Daily realised loss ceiling (absolute, settlement base units).
-  maxDailyLossRaw: REQUIRED_OWNER_BINDING
+  # Daily realised loss ceiling (absolute, settlement base units). $2.00.
+  maxDailyLossRaw: 2000000
+  # An out-of-process switch that does not depend on this host being reachable.
+  # When set, ANY non-empty value other than the documented "run" token pauses.
+  independentPause:
+    # Remote pause document: a URL whose body is JSON {"paused": true}.
+    # Empty disables the remote channel (local file + env still work).
+    url: ""
+    # How long a cached remote value may be trusted if the endpoint fails.
+    # Long, because a dead monitor must not silently un-pause the engine.
+    staleAfterMs: 300000
+    timeoutMs: 3000

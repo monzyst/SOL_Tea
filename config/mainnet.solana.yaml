@@ -1,36 +1,72 @@
 # SOL_Tea — Solana mainnet binding.
 #
-# `REQUIRED_OWNER_BINDING` is a hard placeholder: validation refuses to start a
-# live lane while any remain. Filling one in is an explicit owner action, never a
-# silent default. No secret material belongs in this file.
+# `REQUIRED_OWNER_BINDING` is still legal here: a value blanked out returns the
+# engine to observe-only with a stated reason instead of crashing. The shipped
+# values are real, verifiable mainnet identities EXCEPT where a deployed program
+# of ours is required (see `guard`), because inventing one would be a lie that
+# only fails after money moves.
+#
+# No secret material belongs in this file. Public keys only.
 schemaVersion: v6.0
 
 chain:
   # Solana mainnet-beta genesis hash (verify with RPC getGenesisHash).
   genesisHash: 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
-  # Master switch. Keep false until the PRE-LIVE gate is signed off.
+  # Master switch. Keep false until the PRE-LIVE checklist in docs/RUNBOOK.md
+  # is signed off AND `npm run check:config` reports a fully bound lane.
   enabled: false
   # Settlement asset for the cycle: USDC.
   settlementMint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
   txFormat: v0
-  # `confirmed` is the fastest commitment still safe to build on.
+  # `confirmed` is the fastest commitment still safe to build on. Use
+  # `finalized` to require settlement certainty at the cost of ~13s of latency.
   commitment: confirmed
+  # How the execution path behaves:
+  #   observe  — decode + admit + record; never sign. (default)
+  #   dry-run  — build and sign locally, never submit; verifies the whole path.
+  #   live     — sign and submit. Requires enabled=true, a wallet, and the
+  #              PRE-LIVE checklist to have passed.
+  executionMode: observe
 
 lender:
-  # Flash liquidity provider. Disabled: no live program proof in this release.
+  # Flash liquidity provider. DISABLED: no live program proof in this release,
+  # so no borrow instruction is ever constructed. See docs/ARCHITECTURE.md.
   kind: JUPITER_LEND
   programId: REQUIRED_OWNER_BINDING
   sdkVersion: 0.0.0-unpinned
   enabled: false
+  # Fee the lender charges, in bps. Duplicated from policy on purpose: the
+  # economic test uses the policy value, this one must match the deployed
+  # program. A mismatch is caught by check:config.
+  feeBps: 0
+
+guard:
+  # Our trusted-baseline guard program. NOT DEPLOYED/PROVEN, therefore still a
+  # placeholder. The composition layer refuses to mark anything executable while
+  # this is unresolved, which is the honest state.
+  programId: REQUIRED_OWNER_BINDING
+  enabled: false
+  # Rent is reclaimed by CLOSE_GUARD at the end of every attempt; without it a
+  # guard PDA per intent leaks ~0.002 SOL each.
+  closeAfterAttempt: true
 
 executor:
   # Public address only. The keypair lives outside the repo (WALLET_KEYPAIR_PATH).
   operatorPublicAddress: REQUIRED_OWNER_BINDING
   treasuryAddress: REQUIRED_OWNER_BINDING
-  # Two Whirlpool swaps + ATA setup + compute budget fit comfortably here.
+  # Two Whirlpool swaps + 2 ATA setup + compute budget + guard fit in 400k CU.
   maxComputeUnits: 400000
-  # Priority fee in micro-lamports per compute unit. Mainnet tuning is TBD.
+  # Static fallback only. The adaptive estimator overrides this at runtime and
+  # the effective value is always clamped into the policy's [floor, ceiling].
   priorityFeeMicroLamports: 1000
+  # Refuse to sign a quote older than this, independent of feed age.
+  maxQuoteAgeMs: 2500
+
+store:
+  # Durable state (reservations, intents, route health, settlements, outbox).
+  # SQLite in WAL mode; point this at a persistent volume in production.
+  path: var/state/sol-tea.db
+  busyTimeoutMs: 5000
 
 market:
   # Orca Whirlpool program (mainnet).
@@ -53,6 +89,10 @@ market:
       feeRatePpm: 500
   # A quote older than this is never used to build a transaction.
   maxQuoteAgeMs: 2000
+  # Liquidity maps (tick arrays) are cached for this long.
+  liquidityMapMaxAgeMs: 4000
+  # Tick arrays to load on each side of the current tick.
+  liquidityMapSpan: 2
   reconnectBaseMs: 500
   reconnectMaxMs: 30000
   healthCheckIntervalMs: 5000

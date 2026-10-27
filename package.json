@@ -14,8 +14,15 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test tests/unit/*.test.ts",
-    "verify": "npm run typecheck && npm run test",
-    "check:config": "tsx scripts/check-config.ts"
+    "test:live": "node --import tsx --test tests/live/*.test.ts",
+    "verify": "npm run typecheck && npm run test && npm run lint:boundaries",
+    "check:config": "tsx scripts/check-config.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "report": "tsx scripts/report.ts",
+    "start:worker": "node dist/apps/solana-worker/src/main.js",
+    "start:reconciler": "node dist/apps/reconciler/src/main.js",
+    "start:signer": "node dist/apps/signer-service/src/main.js",
+    "lint:boundaries": "tsx scripts/check-boundaries.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",
@@ -23,10 +30,13 @@
     "@orca-so/whirlpools-sdk": "0.22.0",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.99.0",
+    "better-sqlite3": "11.10.0",
+    "bn.js": "5.2.5",
     "yaml": "2.9.1",
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
     "@types/bn.js": "5.2.0",
     "@types/node": "20.19.43",
     "tsx": "4.23.15",
