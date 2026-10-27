@@ -54,7 +54,7 @@ const baseInput = {
   lastFailureAtUtc: null,
   nowUtc: new Date('2026-10-27T01:00:00.000Z'),
   paused: false,
-  liveExecutionEnabled: true,
+  executionArmed: true,
 };
 
 test('a healthy candidate is admitted', () => {
@@ -69,13 +69,28 @@ test('emergency pause wins over every other gate', () => {
   assert.equal(decision.reason, 'PAUSED');
 });
 
-test('observe-only mode rejects with PAUSED', () => {
+test('observe mode evaluates economics, then reports DISARMED rather than PAUSED', () => {
+  // The distinction matters: PAUSED means a human stopped trading, DISARMED means
+  // the opportunity was measured and merely could not be submitted. Conflating
+  // them makes an operator chase a pause nobody set, and hides whether the edge
+  // existed at all.
   const decision = admitOpportunity({
     ...baseInput,
     policy: resolvedPolicy(),
-    liveExecutionEnabled: false,
+    executionArmed: false,
   });
-  assert.equal(decision.reason, 'PAUSED');
+  assert.equal(decision.reason, 'LIVE_EXECUTION_DISARMED');
+  assert.equal(decision.detail.wouldAdmit, true, 'a passing opportunity is reported as would-admit');
+
+  // ... and an opportunity that fails economics must still report the economic
+  // reason, NOT DISARMED: disarming must never mask a real rejection.
+  const noEdge = admitOpportunity({
+    ...baseInput,
+    policy: resolvedPolicy(),
+    grossSurplusRaw: 1n,
+    executionArmed: false,
+  });
+  assert.equal(noEdge.reason, 'NO_EDGE_AFTER_FEES');
 });
 
 test('unresolved owner bindings block admission', () => {
