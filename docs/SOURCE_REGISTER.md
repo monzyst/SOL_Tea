@@ -101,14 +101,23 @@ Derived from live accounts and cross-checked against the published layout.
 | 47 | protocolFeeRate | u16 | recorded |
 | 49 | liquidity | u128 | depth |
 | 65 | sqrtPrice | u128 | price |
+| 81 | tickCurrentIndex | i32 | diagnostics |
+| 85 | protocolFeeOwedA | u64 | — |
+| 93 | protocolFeeOwedB | u64 | — |
 | 101 | mintA | pubkey | identity check |
 | 133 | vaultA | pubkey | reserve read |
 | 181 | mintB | pubkey | identity check |
 | 213 | vaultB | pubkey | reserve read |
-| 245 | tickCurrentIndex | i32 | diagnostics |
+| 245 | feeGrowthGlobalB | u128 | — (NOT the tick) |
 
 u128 fields are little-endian `(hi << 64) | lo`. SPL token account balances are a
 u64 at offset 64.
+
+**A note on 245.** An earlier revision decoded `tickCurrentIndex` from offset 245,
+which is actually `feeGrowthGlobalB`. That produced a plausible-looking but
+impossible tick (327527288). The true value sits at 81 and reads -23064, which
+matches the tick implied by the decoded `sqrtPrice` (-23063.6).
+`tests/unit/whirlpool.test.ts` pins this so it cannot drift again.
 
 **This layout is a validated observation, not a permanent guarantee.** If Orca
 ships a new pool version, `decodeWhirlpool` fails closed on size or owner before
@@ -124,6 +133,7 @@ it reads a single field.
 | `@orca-so/common-sdk` | 0.6.x | `Percentage` helper |
 | `@solana/web3.js` | 1.99.x | RPC, transactions, subscriptions |
 | `@solana/spl-token` | 0.4.x | ATA derivation |
+| `@coral-xyz/anchor` | 0.32.1 | Transitive peer of the Whirlpool SDK (not imported directly) |
 
 `WHIRLPOOL_SDK_VERSION` is stamped onto every `ExecutableQuote`, so a quote in a
 log can always be traced to the code that produced it.

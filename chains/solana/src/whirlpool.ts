@@ -16,18 +16,27 @@ import { WHIRLPOOL_PROGRAM_ID, type PoolBinding } from '../../../packages/regist
 
 /** whirlpool account discriminators / layout constants (Whirlpool v1, 653 bytes). */
 export const WHIRLPOOL_ACCOUNT_SIZE = 653;
-/** Byte offsets in the serialized `Whirlpool` account. */
+/**
+ * Byte offsets in the serialized `Whirlpool` account.
+ *
+ * Verified against the live Czfq3x… account on mainnet-beta. `tickCurrent` in
+ * particular was previously read from 245, which is the low half of
+ * feeGrowthGlobalB — that produced impossible ticks (e.g. 327527288) instead of
+ * the real value around -23064. It is diagnostics-only, but a wrong number in
+ * /healthz misleads during an incident, so it is pinned by a regression test.
+ */
 export const OFFSETS = {
   tickSpacing: 41,
   feeRate: 45,
   protocolFeeRate: 47,
   liquidity: 49,
   sqrtPrice: 65,
+  /** tick_current_index: i32 at 81 (before protocolFeeOwedA at 85). */
+  tickCurrent: 81,
   mintA: 101,
   vaultA: 133,
   mintB: 181,
   vaultB: 213,
-  tickCurrent: 245,
 } as const;
 
 export interface PoolSnapshot {
