@@ -1,0 +1,84 @@
+# Implementation status — machine-readable counterpart to the README section
+# "Known limitations and outstanding items". Consumed by operator tooling.
+#
+# States: DONE | PARTIAL | BLOCKED | NOT_STARTED
+# A PARTIAL item is wired and tested but not proven against live capital.
+
+version: 1
+updated: "2026-10-27"
+chain: solana-mainnet-beta
+default_mode: observe-only
+
+modules:
+  domain:
+    state: DONE
+    note: Integer amounts, asset identity, reason codes.
+  config:
+    state: DONE
+    note: Strict env + YAML contracts; REQUIRED_OWNER_BINDING rejects unresolved files.
+  registry:
+    state: DONE
+    note: Two verified WSOL/USDC Whirlpools bound by mint identity.
+  obs:
+    state: DONE
+    note: JSON logs, redaction, latency histogram, funnel.
+  rpc:
+    state: PARTIAL
+    note: Failover and reconnect implemented; only one provider provisioned.
+  market:
+    state: DONE
+    note: Coherence, freshness and slot-skew gates with reason codes.
+  strategies:
+    state: DONE
+    note: Two-pool cycle discovery, both directions, net-edge ranking.
+  policy:
+    state: PARTIAL
+    note: Admission and reservations correct; ledger is in-memory, not durable.
+  journal:
+    state: DONE
+    note: Hash-chained append-only outbox; verifies chain on load.
+  signer:
+    state: DONE
+    note: Intent firewall + path/permission checks. No key shipped.
+  executor:
+    state: PARTIAL
+    note: Build/submit/outcome implemented; inline call site gated behind sign-off.
+  reconcile:
+    state: DONE
+    note: Balance-delta verdicts; refuses to book unproven receipts.
+  quoter:
+    state: DONE
+    note: Official SDK tick-array quoting; enforces admitted minimumAmountOut.
+
+live_readiness:
+  - id: owner-policy-bindings
+    state: BLOCKED
+    owner_action: Resolve all REQUIRED_OWNER_BINDING values in config/policy.solana.yaml.
+  - id: dedicated-rpc
+    state: BLOCKED
+    owner_action: Provision a dedicated HTTP+WS provider; set secondary.
+  - id: adaptive-priority-fee
+    state: NOT_STARTED
+    owner_action: Replace the static 1000 micro-lamport constant.
+  - id: flash-loan-composition
+    state: NOT_STARTED
+    owner_action: Prove borrow/repay against Jupiter Lend before enabling.
+  - id: live-decision-callsite
+    state: PARTIAL
+    owner_action: Enable the quoter/executor call site after PRE-LIVE sign-off.
+  - id: alerting-transport
+    state: NOT_STARTED
+    owner_action: Bind alertTargetRef to a real transport.
+
+verified:
+  genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+  pools:
+    - address: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+      tick_spacing: 4
+      fee_rate_ppm: 400
+      liquidity_observed: "652304795979366"
+    - address: 7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm
+      tick_spacing: 8
+      fee_rate_ppm: 500
+      liquidity_observed: "539307545852"
+  live_smoke: "16 pool updates ingested, reserves hydrated, pool decoded COHERENT at slot 461982568"
