@@ -46,12 +46,30 @@ export interface SubscriptionManagerOptions {
   /** A slot jump larger than this invalidates cached state. */
   readonly maxSlotGap: number;
   readonly logger: Logger;
+  /**
+   * Provider whose stream this manager is attached to. Reported in every
+   * update so the market layer can attribute a gap to the right backend
+   * (audit T07).
+   */
   readonly providerId: string;
   readonly onPoolUpdate: (update: PoolUpdate) => void;
+  /** Called on every slot heartbeat with the current chain tip. */
+  readonly onSlot?: (slot: number) => void;
   readonly onGap: (gap: StreamGap) => void;
   readonly onStatus: (status: StreamStatus, detail?: Record<string, unknown>) => void;
-  /** Connection factory kept injectable so the manager is unit-testable. */
+  /**
+   * Connection factory kept injectable so the manager is unit-testable. The
+   * `wsUrl` argument is a hint only: a failover factory ignores it and picks
+   * the next healthy provider, which is the behaviour we want in production
+   * (see FailoverConnectionFactory).
+   */
   readonly connect: (wsUrl: string, commitment: 'confirmed' | 'finalized') => Connection;
+  /**
+   * Optional hook reporting which provider a (re)connect actually used. When
+   * present, the manager adopts that id so `providerId` on each update is the
+   * truth, not the configuration default.
+   */
+  readonly resolveProviderId?: () => string;
 }
 
 export class SubscriptionManager {
@@ -66,11 +84,14 @@ export class SubscriptionManager {
   private status: StreamStatus = 'idle';
   private stopped = false;
   private readonly poolKeys: PublicKey[];
+  /** Provider currently serving this stream; refreshed on every reconnect. */
+  private activeProviderId: string;
 
   constructor(private readonly options: SubscriptionManagerOptions) {
     this.poolKeys = options.poolAddresses.map((address) => new PublicKey(address));
     if (this.poolKeys.length === 0) throw new Error('at least one pool address is required');
     if (options.maxSlotGap <= 0) throw new Error('maxSlotGap must be positive');
+    this.activeProviderId = options.providerId;
   }
 
   getStatus(): StreamStatus {
@@ -79,6 +100,11 @@ export class SubscriptionManager {
 
   getLastSlot(): number {
     return this.lastSlot;
+  }
+
+  /** Provider currently feeding this stream (changes only on reconnect). */
+  getProviderId(): string {
+    return this.activeProviderId;
   }
 
   async start(): Promise<void> {
@@ -105,7 +131,7 @@ export class SubscriptionManager {
     this.status = status;
     this.options.logger.info('ws_status', {
       status,
-      providerId: this.options.providerId,
+      providerId: this.activeProviderId,
       ...detail,
     });
     this.options.onStatus(status, detail);
@@ -116,6 +142,18 @@ export class SubscriptionManager {
     this.setStatus('connecting', { attempt: this.attempt });
     try {
       this.connection = this.options.connect(this.options.wsUrl, this.options.commitment);
+      // Adopt the provider the factory actually chose, so every update carries
+      // the true source and a gap can be attributed correctly.
+      if (this.options.resolveProviderId) {
+        const resolved = this.options.resolveProviderId();
+        if (resolved !== this.activeProviderId) {
+          this.options.logger.info('ws_provider_changed', {
+            from: this.activeProviderId,
+            to: resolved,
+          });
+          this.activeProviderId = resolved;
+        }
+      }
       this.lastEventMonoNs = nowMonoNs();
 
       // Slot heartbeat: cheap liveness signal for the whole stream.
@@ -130,6 +168,14 @@ export class SubscriptionManager {
         }
         this.lastSlot = slot;
         this.lastEventMonoNs = nowMonoNs();
+        // Expose the tip to the consumer. Treat this callback as HOT PATH: it
+        // fires every slot (~400ms) and must never block or throw.
+        try {
+          this.options.onSlot?.(slot);
+        } catch {
+          // A consumer bug must not tear down the stream; the health timer will
+          // surface a dead feed independently.
+        }
       });
 
       // Pool account subscription.
@@ -151,7 +197,7 @@ export class SubscriptionManager {
       this.setStatus('live', { subscribedPools: this.poolKeys.length });
     } catch (error) {
       this.options.logger.error('ws_connect_failed', {
-        providerId: this.options.providerId,
+        providerId: this.activeProviderId,
         attempt: this.attempt,
         error: (error as Error).message,
       });
@@ -170,7 +216,7 @@ export class SubscriptionManager {
       slot,
       receivedAtUtc: new Date().toISOString(),
       receivedMonoNs: this.lastEventMonoNs,
-      providerId: this.options.providerId,
+      providerId: this.activeProviderId,
     });
   }
 
@@ -184,7 +230,7 @@ export class SubscriptionManager {
     const silenceMs = Number(nowMonoNs() - this.lastEventMonoNs) / 1_000_000;
     if (silenceMs > this.options.stallThresholdMs) {
       this.options.logger.warn('ws_stream_stalled', {
-        providerId: this.options.providerId,
+        providerId: this.activeProviderId,
         silenceMs: Math.round(silenceMs),
       });
       this.setStatus('degraded', { silenceMs: Math.round(silenceMs) });
@@ -205,7 +251,7 @@ export class SubscriptionManager {
     // Jitter prevents a fleet of workers stampeding the same provider.
     const delayMs = Math.round(capped * (0.75 + Math.random() * 0.5));
     this.options.logger.warn('ws_reconnect_scheduled', {
-      providerId: this.options.providerId,
+      providerId: this.activeProviderId,
       reason,
       attempt: this.attempt,
       delayMs,
@@ -224,7 +270,7 @@ export class SubscriptionManager {
       detail: { attempt: this.attempt },
       atUtc: new Date().toISOString(),
     });
-    this.options.logger.info('ws_reconnecting', { providerId: this.options.providerId, reason });
+    this.options.logger.info('ws_reconnecting', { providerId: this.activeProviderId, reason });
     await this.connectAndSubscribe();
   }
 
@@ -247,7 +293,7 @@ export class SubscriptionManager {
 
   /** Force a resync after a gap, e.g. when a route is invalidated. */
   async resync(reason: string): Promise<void> {
-    this.options.logger.info('ws_manual_resync', { providerId: this.options.providerId, reason });
+    this.options.logger.info('ws_manual_resync', { providerId: this.activeProviderId, reason });
     await this.reconnect(reason);
   }
 }
