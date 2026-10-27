@@ -1,0 +1,48 @@
+# --- secrets & local environment (NEVER commit) ---
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+id.json
+*keypair*.json
+*.keypair
+wallet*.json
+credentials*
+service-account*.json
+
+# --- runtime state ---
+var/
+journal/
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+
+# --- dependencies & build output ---
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# --- logs & temp ---
+logs/
+*.log
+npm-debug.log*
+tmp/
+.tmp/
+.cache/
+
+# --- editor / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
