@@ -1,84 +1,174 @@
-# Implementation status — machine-readable counterpart to the README section
-# "Known limitations and outstanding items". Consumed by operator tooling.
+# SOL_Tea — implementation status and defect log.
 #
-# States: DONE | PARTIAL | BLOCKED | NOT_STARTED
-# A PARTIAL item is wired and tested but not proven against live capital.
+# This file records what has actually been verified, not what is planned. Every
+# defect below was found by running the system, and each entry names how it was
+# caught so the same class of bug is visible next time.
 
-version: 1
-updated: "2026-10-27"
-chain: solana-mainnet-beta
-default_mode: observe-only
+schema: 1
+updatedUtc: '2026-10-27'
 
-modules:
-  domain:
-    state: DONE
-    note: Integer amounts, asset identity, reason codes.
-  config:
-    state: DONE
-    note: Strict env + YAML contracts; REQUIRED_OWNER_BINDING rejects unresolved files.
-  registry:
-    state: DONE
-    note: Two verified WSOL/USDC Whirlpools bound by mint identity.
-  obs:
-    state: DONE
-    note: JSON logs, redaction, latency histogram, funnel.
-  rpc:
-    state: PARTIAL
-    note: Failover and reconnect implemented; only one provider provisioned.
-  market:
-    state: DONE
-    note: Coherence, freshness and slot-skew gates with reason codes.
-  strategies:
-    state: DONE
-    note: Two-pool cycle discovery, both directions, net-edge ranking.
-  policy:
-    state: PARTIAL
-    note: Admission and reservations correct; ledger is in-memory, not durable.
-  journal:
-    state: DONE
-    note: Hash-chained append-only outbox; verifies chain on load.
-  signer:
-    state: DONE
-    note: Intent firewall + path/permission checks. No key shipped.
-  executor:
-    state: PARTIAL
-    note: Build/submit/outcome implemented; inline call site gated behind sign-off.
-  reconcile:
-    state: DONE
-    note: Balance-delta verdicts; refuses to book unproven receipts.
-  quoter:
-    state: DONE
-    note: Official SDK tick-array quoting; enforces admitted minimumAmountOut.
+capability:
+  marketData:
+    status: verified-live
+    detail: >-
+      Two Orca Whirlpool accounts subscribed over wss on mainnet; slot heartbeat,
+      gap detection, stall detection, exponential backoff reconnects, and WS
+      failover across the provider rotation.
+  liquidity:
+    status: verified-live
+    detail: >-
+      Tick arrays fetched via PDAUtil.getTickArray and decoded to a LiquidityMap;
+      5 arrays / 439 and 79 initialized ticks observed on the two bound pools.
+  pricing:
+    status: verified-live
+    detail: >-
+      Exact Q64.64 concentrated-liquidity walk crossing every initialized
+      boundary, cross-checked against the Orca SDK as an oracle in unit tests.
+  priorityFee:
+    status: verified-live
+    detail: >-
+      Adaptive percentile estimate from getRecentPrioritizationFees over watched
+      accounts; floor/ceiling clamps, TTL cache, explicit refusal when unpriceable.
+  admission:
+    status: verified-live
+    detail: >-
+      Ordered gates with the first true blocker reported. Observe mode runs the
+      full path and stops at LIVE_EXECUTION_DISARMED.
+  durableState:
+    status: verified
+    detail: >-
+      SQLite WAL store; intent + reservation + outbox written in one transaction;
+      route health persisted across restarts.
+  signing:
+    status: implemented-not-live
+    detail: >-
+      Economic-limit decode, digest binding, compute-price bounds, base58
+      signature encoding, encrypted payload store. No mainnet transaction sent.
+  submission:
+    status: implemented-not-live
+    detail: >-
+      Build, submit, await-inclusion, blockhash-expiry and honest UNKNOWN are
+      implemented and unit-covered; the live path has never carried real funds.
+  reconciliation:
+    status: verified
+    detail: >-
+      Independent process; settles intents against on-chain balances and reports
+      PROVEN_NET_POSITIVE / PROVEN_NET_NON_POSITIVE / UNPROVEN.
+  flashFunding:
+    status: implemented-not-executable
+    detail: >-
+      Composition model and guard arithmetic complete and unit-tested; the
+      borrow wrapper refuses to emit a transaction until proven against a live
+      lender program.
 
-live_readiness:
-  - id: owner-policy-bindings
-    state: BLOCKED
-    owner_action: Resolve all REQUIRED_OWNER_BINDING values in config/policy.solana.yaml.
-  - id: dedicated-rpc
-    state: BLOCKED
-    owner_action: Provision a dedicated HTTP+WS provider; set secondary.
-  - id: adaptive-priority-fee
-    state: NOT_STARTED
-    owner_action: Replace the static 1000 micro-lamport constant.
-  - id: flash-loan-composition
-    state: NOT_STARTED
-    owner_action: Prove borrow/repay against Jupiter Lend before enabling.
-  - id: live-decision-callsite
-    state: PARTIAL
-    owner_action: Enable the quoter/executor call site after PRE-LIVE sign-off.
-  - id: alerting-transport
-    state: NOT_STARTED
-    owner_action: Bind alertTargetRef to a real transport.
+# Defects found and fixed, in the order they were found.
+defects:
+  - id: D01
+    summary: migrate() queried a nonexistent column, so every database failed to open
+    foundBy: first unit test that opened the store
+    impact: total — the durable store could never have opened in production
+    fixed: true
+  - id: D02
+    summary: >-
+      TickArray tick stride was 88 bytes; a real tick is 113 (Anchor pads bool to
+      the i128 alignment), so every mainnet account failed the size check
+    foundBy: live observe run — 50 tick_array_decode_failed events
+    impact: >-
+      total for pricing — the liquidity map stayed empty, so no route could ever
+      be priced, while the process reported healthy and typechecked cleanly
+    fixed: true
+  - id: D03
+    summary: >-
+      TickArray size check demanded an exact byte count; real accounts carry a
+      32-byte trailer beyond the 9956-byte tick region
+    foundBy: live run after D02 — "has 9988 bytes, expected 9956"
+    impact: total for pricing (same class as D02)
+    fixed: true
+    detail: >-
+      Header is 12 bytes and the tick region is exactly 9956; verified against a
+      live account where slot 87 ends precisely at 9956 with 87/88 slots
+      initialized. The decoder now requires at least the tick region and ignores
+      the trailer.
+  - id: D04
+    summary: TickArray decode ignored tickSpacing, so slot i mapped to start+i
+    foundBy: code review while fixing D02
+    impact: >-
+      boundaries placed at ticks where liquidity never changes; walk crosses
+      phantom boundaries and understates output
+    fixed: true
+  - id: D05
+    summary: >-
+      observe mode short-circuited to PAUSED before pricing, so the mode never
+      exercised the decision path at all
+    foundBy: /healthz showed 100% PAUSED with the control.paused gauge at 0
+    impact: observe-only proved nothing and mislabelled itself as an operator pause
+    fixed: true
+  - id: D06
+    summary: >-
+      admission treated "not armed" as an input to economics instead of a final
+      submission gate
+    foundBy: D05 analysis
+    impact: disarming masked real economic rejections
+    fixed: true
+  - id: D07
+    summary: freshness measured as wall-clock age since the pool account last changed
+    foundBy: live run — second pool permanently 42s "stale" while healthy
+    impact: a quiet pool never changes, so a healthy feed reported FEED_STALE forever
+    fixed: true
+    detail: replaced with slot lag behind the chain tip, fed by the slot heartbeat.
+  - id: D08
+    summary: leg-vs-leg slot skew used as a coherence test
+    foundBy: live run — FEED_GAP on every evaluation
+    impact: >-
+      CLMM accounts change only on swaps, so healthy legs differ by hundreds of
+      slots and every pair was rejected permanently
+    fixed: true
+  - id: D09
+    summary: >-
+      evaluation was triggered only by pool account changes, leaving the engine
+      idle on a quiet venue
+    foundBy: live run — 4 evaluations in 68s
+    impact: missed windows that open without either pool printing an update
+    fixed: true
+    detail: added a bounded 1s cadence alongside the event-driven path.
+  - id: D10
+    summary: signer encoded signatures as base64, which is not Solana wire format
+    foundBy: code review of the signing path
+    impact: every signature would have been rejected by the network
+    fixed: true
+  - id: D11
+    summary: reconciler and signer-service did not load .env before validation
+    foundBy: running each role standalone
+    impact: neither role could boot with a valid .env present
+    fixed: true
+  - id: D12
+    summary: >-
+      amountBDelta in the liquidity walk used a 2^64-scaled term, producing
+      quotes off by 2^64
+    foundBy: SDK-oracle unit test
+    impact: total for pricing correctness
+    fixed: true
 
-verified:
-  genesis_hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
-  pools:
-    - address: Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
-      tick_spacing: 4
-      fee_rate_ppm: 400
-      liquidity_observed: "652304795979366"
-    - address: 7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm
-      tick_spacing: 8
-      fee_rate_ppm: 500
-      liquidity_observed: "539307545852"
-  live_smoke: "16 pool updates ingested, reserves hydrated, pool decoded COHERENT at slot 461982568"
+verification:
+  unitTests: 74
+  typecheck: pass
+  build: pass
+  moduleBoundaries: pass
+  configValidation: pass
+  liveObserveRun: >-
+    verified — stream live, both pools COHERENT, liquidity 5 arrays each,
+    evaluation cadence ~1/s, funnel reporting NO_EDGE_AFTER_FEES
+  mainnetTransaction: none
+
+blockingLiveLaunch:
+  - flash-funding composition not proven against a live lender program
+  - no dedicated RPC provider
+  - live submission path has never carried real funds
+  - second bound pool is materially less active than the first
+
+nextSteps:
+  - Prove the flash-borrow wrapper on devnet, then a minimum-size mainnet clip.
+  - Replace the public RPC with a dedicated provider and two independent domains.
+  - Add Raydium CLMM as a second venue family.
+  - Extend arb-clmm from binary to three-pool cycles.
+  - Size each attempt toward the optimal clip once fill data exists.
